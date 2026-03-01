@@ -95,8 +95,8 @@ table_props = TableProperties(table_name)
 stream = sdk.create_stream(client_id, client_secret, table_props, options)
 try:
     record = {"device_name": "sensor-1", "temp": 22, "humidity": 55}
-    ack = stream.ingest_record(record)
-    ack.wait_for_ack()
+    offset = stream.ingest_record_offset(record)
+    stream.wait_for_offset(offset)
 finally:
     stream.close()
 ```
@@ -193,7 +193,7 @@ The timestamp generation must use microseconds for Databricks.
 - **gRPC + Protobuf**: Zerobus uses gRPC as its transport protocol. Any application that can communicate via gRPC and construct Protobuf messages can produce to Zerobus.
 - **JSON or Protobuf serialization**: JSON for quick starts; Protobuf for type safety, forward compatibility, and performance.
 - **At-least-once delivery**: The connector provides at-least-once guarantees. Design consumers to handle duplicates.
-- **Durability ACKs**: Each ingested record returns an ACK confirming durable write. ACKs indicate all records up to that offset have been durably written.
+- **Durability ACKs**: Each ingested record returns an offset. Use `wait_for_offset(offset)` to confirm durable write. ACKs indicate all records up to that offset have been durably written.
 - **No table management**: Zerobus does not create or alter tables. You must pre-create your target table and manage schema evolution yourself.
 - **Single-AZ durability**: The service runs in a single availability zone. Plan for potential zone outages.
 
