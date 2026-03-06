@@ -134,6 +134,37 @@ def main():
         default=None,
         help="Directory for GEPA checkpoints. Resumes from last state if dir exists.",
     )
+    # Agent evaluation flags
+    parser.add_argument(
+        "--agent-eval",
+        action="store_true",
+        help="Hybrid mode: use real Claude Code agent for baseline + validation, "
+             "proxy for GEPA iterations.",
+    )
+    parser.add_argument(
+        "--agent-eval-full",
+        action="store_true",
+        help="Full agent mode: use real Claude Code agent for ALL GEPA iterations "
+             "(slow but most accurate).",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="Model for agent execution (e.g., databricks-claude-sonnet-4-6). "
+             "Defaults to ANTHROPIC_MODEL env var.",
+    )
+    parser.add_argument(
+        "--agent-timeout",
+        type=int,
+        default=300,
+        help="Timeout per agent run in seconds (default: 300).",
+    )
+    parser.add_argument(
+        "--mlflow-experiment",
+        default=None,
+        help="MLflow experiment name for agent tracing (default: SKILL_TEST_MLFLOW_EXPERIMENT env or /Shared/skill-tests).",
+    )
+
     parser.add_argument(
         "--generate-from",
         type=str,
@@ -238,6 +269,11 @@ def main():
                     judge_model=args.judge_model,
                     align=args.align,
                     run_dir=f"{args.run_dir}/{name}" if args.run_dir else None,
+                    agent_eval=args.agent_eval,
+                    agent_eval_full=args.agent_eval_full,
+                    agent_model=args.agent_model,
+                    agent_timeout=args.agent_timeout,
+                    mlflow_experiment=args.mlflow_experiment,
                 )
                 review_optimization(result)
                 if args.apply and not args.dry_run:
@@ -275,6 +311,11 @@ def main():
                 judge_model=args.judge_model,
                 align=args.align,
                 run_dir=args.run_dir,
+                agent_eval=args.agent_eval,
+                agent_eval_full=args.agent_eval_full,
+                agent_model=args.agent_model,
+                agent_timeout=args.agent_timeout,
+                mlflow_experiment=args.mlflow_experiment,
             )
             review_optimization(result)
             if args.apply and not args.dry_run:

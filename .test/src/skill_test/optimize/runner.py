@@ -1,7 +1,11 @@
 """End-to-end orchestrator for GEPA skill optimization.
 
 Uses optimize_anything API: evaluator function + GEPAConfig.
-Single evaluator path using SkillBench judge-based evaluation.
+Supports two evaluation modes:
+  - skillbench (default): fast proxy using litellm.completion + judges
+  - agent-eval (hybrid): proxy for GEPA iterations, real Claude Code agent
+    for baseline scoring and final validation
+  - agent-eval-full: real Claude Code agent for all GEPA iterations
 """
 
 import copy
@@ -55,6 +59,10 @@ class OptimizationResult:
     tool_map: Any = None
     evaluator_type: str = "skillbench"
     skillbench_side_info: dict[str, dict] | None = None
+    # Agent evaluation results (populated when --agent-eval is used)
+    agent_baseline_score: float | None = None
+    agent_validation_score: float | None = None
+    agent_side_info: dict[str, dict] | None = None
 
 
 def _compute_diff_summary(original: str, optimized: str) -> str:
@@ -128,6 +136,14 @@ def optimize_skill(
     judge_model: str | None = None,
     align: bool = False,
     run_dir: str | None = None,
+    # Agent evaluation
+    agent_eval: bool = False,
+    agent_eval_full: bool = False,
+    agent_model: str | None = None,
+    agent_timeout: int = 300,
+    mlflow_experiment: str | None = None,
+    mcp_config: dict | None = None,
+    agent_allowed_tools: list[str] | None = None,
     # Deprecated params kept for backward compat
     mode: str = "static",
     task_lm: str | None = None,
@@ -155,6 +171,13 @@ def optimize_skill(
         judge_model: Override judge model (future use)
         align: Use MemAlign alignment (future use)
         run_dir: Directory for GEPA checkpoints. Resumes from last state if dir exists.
+        agent_eval: Use hybrid mode — proxy for GEPA iterations, real agent for
+            baseline scoring and final validation.
+        agent_eval_full: Use agent evaluator for ALL GEPA iterations (slow but accurate).
+        agent_model: Model to use for agent execution (e.g., databricks-claude-sonnet-4-6).
+        agent_timeout: Timeout per agent run in seconds (default 300).
+        mcp_config: MCP server configuration for agent execution.
+        agent_allowed_tools: Allowed tools for agent execution.
     """
     # 1. Load SKILL.md
     skill_path = find_skill_md(skill_name)
@@ -259,6 +282,35 @@ def optimize_skill(
         tool_context=tool_context_str,
     )
 
+    # 4b. Build agent evaluator if requested
+    agent_evaluator = None
+    agent_baseline_score = None
+    agent_baseline_per_task = None
+    agent_baseline_si = None
+
+    if agent_eval or agent_eval_full:
+        from .agent_evaluator import create_agent_evaluator, build_agent_eval_background
+
+        print("Agent evaluation: ENABLED")
+        agent_evaluator = create_agent_evaluator(
+            skill_name,
+            original_token_counts=original_token_counts,
+            token_budget=token_budget,
+            judge_model=judge_model,
+            mcp_config=mcp_config,
+            allowed_tools=agent_allowed_tools,
+            agent_model=agent_model,
+            agent_timeout=agent_timeout,
+            mlflow_experiment=mlflow_experiment,
+        )
+
+        if agent_eval_full:
+            # Use agent evaluator for all GEPA iterations
+            evaluator = agent_evaluator
+            print("Mode: agent-eval-full (agent for ALL iterations)")
+        else:
+            print("Mode: agent-eval hybrid (proxy for GEPA, agent for baseline + validation)")
+
     # 5. Get config (scaled by component count)
     num_components = len(seed_candidate)
     config = get_preset(
@@ -355,6 +407,18 @@ def optimize_skill(
         )
         print(f"\nBackground preview:\n{background[:500]}...")
 
+        # Agent baseline in dry run
+        dry_run_agent_score = None
+        dry_run_agent_si = None
+        if agent_evaluator:
+            print(f"\nAgent baseline ({len(train)} tasks)...")
+            dry_run_agent_score, agent_per_task, dry_run_agent_si, _ = _evaluate_on_tasks(
+                agent_evaluator, seed_candidate, train, label="Agent baseline"
+            )
+            print(f"Agent baseline score: {dry_run_agent_score:.3f}")
+            for task_id, score in agent_per_task.items():
+                print(f"  {task_id}: {score:.3f}")
+
         return OptimizationResult(
             skill_name=skill_name,
             original_score=original_score,
@@ -374,6 +438,9 @@ def optimize_skill(
             tool_map=tool_map,
             evaluator_type="skillbench",
             skillbench_side_info=si_by_id,
+            agent_baseline_score=dry_run_agent_score,
+            agent_validation_score=None,
+            agent_side_info=dry_run_agent_si,
         )
 
     # Evaluate original and capture per-task detail for baseline context
@@ -398,6 +465,16 @@ def optimize_skill(
         "Focus on what the agent would otherwise get wrong. "
         "Be concise — remove redundant examples and verbose explanations."
     )
+
+    # 6b. Agent baseline scoring (hybrid mode: before GEPA loop)
+    if agent_evaluator and not agent_eval_full:
+        print(f"\n  Agent baseline scoring ({len(train)} tasks)...")
+        agent_baseline_score, agent_baseline_per_task, agent_baseline_si, _ = _evaluate_on_tasks(
+            agent_evaluator, seed_candidate, train, label="Agent baseline"
+        )
+        print(f"  Agent baseline score: {agent_baseline_score:.3f}")
+        for task_id, score in agent_baseline_per_task.items():
+            print(f"    {task_id}: {score:.3f}")
 
     # 7. Convert datasets to GEPA format
     trainset = to_gepa_instances(train)
@@ -497,6 +574,8 @@ def optimize_skill(
         import mlflow
 
         stc = SkillTestConfig()
+        if mlflow_experiment:
+            stc.mlflow.experiment_name = mlflow_experiment
         setup_mlflow(stc)
         with mlflow.start_run(run_name=f"{skill_name}_optimize_{preset}"):
             mlflow.set_tags(
@@ -525,6 +604,31 @@ def optimize_skill(
     # Capture final side_info for review output
     _, _, final_si_by_id, _ = _evaluate_on_tasks(evaluator, best, train, label="Final eval")
 
+    # 11. Agent validation (hybrid mode: after GEPA loop)
+    agent_validation_score = None
+    agent_validation_si = None
+
+    if agent_evaluator and not agent_eval_full:
+        print(f"\n  Agent validation scoring ({len(train)} tasks on best candidate)...")
+        agent_validation_score, agent_val_per_task, agent_validation_si, _ = _evaluate_on_tasks(
+            agent_evaluator, best, train, label="Agent validation"
+        )
+        print(f"  Agent validation score: {agent_validation_score:.3f}")
+        for task_id, score in agent_val_per_task.items():
+            print(f"    {task_id}: {score:.3f}")
+
+        # Report comparison
+        if agent_baseline_score is not None:
+            agent_improvement = agent_validation_score - agent_baseline_score
+            print(f"\n  Agent score comparison:")
+            print(f"    Baseline: {agent_baseline_score:.3f}")
+            print(f"    Validated: {agent_validation_score:.3f}")
+            print(f"    Improvement: {agent_improvement:+.3f}")
+            print(f"\n  Proxy score comparison:")
+            print(f"    Baseline: {original_score:.3f}")
+            print(f"    Optimized: {optimized_score:.3f}")
+            print(f"    Improvement: {optimized_score - original_score:+.3f}")
+
     return OptimizationResult(
         skill_name=skill_name,
         original_score=original_score,
@@ -542,6 +646,9 @@ def optimize_skill(
         components=dict(best),
         original_components=dict(seed_candidate),
         tool_map=tool_map,
-        evaluator_type="skillbench",
+        evaluator_type="agent" if agent_eval_full else "skillbench",
         skillbench_side_info=final_si_by_id,
+        agent_baseline_score=agent_baseline_score,
+        agent_validation_score=agent_validation_score,
+        agent_side_info=agent_validation_si,
     )

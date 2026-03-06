@@ -265,51 +265,220 @@ uv run python .test/scripts/optimize.py databricks-metric-views --preset quick -
 
 ## What Can Be Optimized
 
-GEPA treats any text artifact as a candidate for optimization. Skills and tools are optimized **separately** to avoid cross-skill interference.
+GEPA treats any text artifact as a candidate for optimization. There are two distinct text artifacts that influence how Claude Code handles Databricks tasks, and they serve fundamentally different roles:
 
-### Skills (SKILL.md files) — default mode
+| Artifact | Where it lives | What it controls | Scope |
+|----------|---------------|-----------------|-------|
+| **SKILL.md** | `databricks-skills/<skill>/SKILL.md` | Domain knowledge: API syntax, code patterns, best practices, constraints | One skill = one domain (e.g., metric views, SDP pipelines) |
+| **Tool descriptions** | `databricks-mcp-server/tools/*.py` (`@mcp.tool` docstrings) | Tool selection: what each MCP tool does, when to use it, what arguments it takes | Shared across ALL skills — every agent session sees the same tool descriptions |
 
-SKILL.md files teach agents Databricks patterns — API syntax, code examples, best practices. Each skill is a standalone GEPA component (`skill_md`). Tool descriptions are loaded as **read-only context** — included in the generation prompt so the evaluator sees realistic agent behavior, but not mutated by GEPA.
+Understanding the difference is key to choosing the right optimization approach.
 
-This means `--preset quick` always uses **1 component / 15 metric calls per pass**, regardless of how many tool modules exist.
+### Why optimize skills and tools separately
+
+Skills and tools operate at different layers of the agent's decision-making:
+
+1. **Tools determine *what* the agent does** — Tool descriptions are what Claude reads to decide which MCP tool to call. If `execute_sql`'s description says "Run SQL queries", the agent might use it for everything. If it says "Execute read/write SQL statements on Databricks SQL warehouses", the agent makes better choices about when to use it vs Bash vs other tools.
+
+2. **Skills determine *how* the agent does it** — SKILL.md files teach the agent domain-specific patterns it wouldn't otherwise know. A metric views skill teaches `WITH METRICS LANGUAGE YAML` syntax; an SDP skill teaches `CREATE OR REFRESH STREAMING TABLE` patterns.
+
+3. **Tools are shared, skills are scoped** — This is the critical distinction. Tool descriptions are seen by every agent session regardless of which skill is active. If you optimize a tool description to work well for metric views tasks, you might make it worse for SDP or model serving tasks. Skills, by contrast, are only loaded when their domain is relevant.
+
+This creates a **confounding variable problem** when optimizing them together. If GEPA mutates both the skill and a tool description in the same run:
+- Did the score improve because the skill got better, or because the tool description changed?
+- Will the tool description change break other skills that depend on it?
+- GEPA's reflection LM can't distinguish which component caused the improvement.
+
+Optimizing separately isolates the variables:
+- **Skill optimization** (default mode): holds tool descriptions fixed as read-only context, mutates only the SKILL.md. Improvements are attributable to better domain knowledge.
+- **Tool optimization** (`--tools-only`): holds skills fixed, mutates only tool docstrings. Uses a cross-skill dataset to ensure changes work universally, not just for one domain.
+
+### Recommended optimization workflow
+
+The recommended order addresses the dependency chain — tools are the foundation, skills build on top.
+
+#### Step 1: Optimize tools first (universal, cross-skill)
+
+Tool descriptions are the foundation. An agent can't use the right tool if it doesn't understand what the tools do, regardless of how good the skill is. Optimize tools against a diverse cross-skill dataset so they generalize.
 
 ```bash
-# Optimize a skill (tools loaded as read-only context)
+# See what modules exist and their token counts
+uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --dry-run
+
+# Optimize all tool descriptions (cross-skill evaluation)
+uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --preset quick
+
+# Or optimize specific modules (e.g., SQL tools are most impactful)
+uv run python .test/scripts/optimize.py databricks-metric-views --tools-only \
+    --tool-modules sql serving compute --preset quick
+
+# Review and apply
+uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --apply-last
+```
+
+**What to look for**: The cross-skill dataset samples tasks from ALL skills with `ground_truth.yaml`. Watch for regressions where improving one skill's tool usage hurts another. The `--dry-run` output shows per-task scores broken down by source skill.
+
+**Validate with agent eval**: After applying tool changes, run `--agent-eval --dry-run` on a few skills to verify the agent actually picks the right tools:
+
+```bash
+# Check that metric views tasks still use manage_metric_views, not Bash
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --dry-run
+
+# Check that SDP tasks still use execute_sql, not Bash
+uv run python .test/scripts/optimize.py databricks-spark-declarative-pipelines --agent-eval --dry-run
+```
+
+#### Step 2: Optimize skills (per-skill, domain-specific)
+
+With stable tool descriptions as the foundation, optimize each skill's SKILL.md. The evaluator loads the (now-optimized) tool descriptions as read-only context, so the skill is evaluated in a realistic environment.
+
+```bash
+# Optimize a specific skill
 uv run python .test/scripts/optimize.py databricks-metric-views --preset quick
 
-# Optimize all skills that have test cases
+# With agent validation to verify tool behavior
+uv run python .test/scripts/optimize.py databricks-metric-views --preset quick --agent-eval
+
+# Optimize all skills sequentially
 uv run python .test/scripts/optimize.py --all --preset quick
+
+# Optimize and immediately apply
+uv run python .test/scripts/optimize.py databricks-metric-views --preset quick --apply
 ```
 
-### MCP Tool Descriptions — `--tools-only` mode
+**What to look for**: The per-task `side_info` shows exactly which expected facts the skill teaches and which it misses. The `Judge_quality_with` rationale explains scoring in detail. With `--agent-eval`, you also see which tools the agent called and whether they succeeded.
 
-`@mcp.tool` docstrings in `databricks-mcp-server/` are what the agent sees when deciding which tool to call. Concise, accurate descriptions improve tool selection. Each tool module becomes a separate GEPA component (`tools_sql`, `tools_serving`, etc.).
+#### Step 3 (optional): Co-optimize skills + tools (`--include-tools`)
 
-Tool optimization uses a **cross-skill dataset** — tasks are sampled from all skills with `ground_truth.yaml` — so optimized docstrings work well across skills, not just one.
-
-```bash
-# Optimize tool descriptions with cross-skill evaluation
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only
-
-# Optimize specific tool modules only
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --tool-modules sql serving compute
-```
-
-When applied (`--apply`), optimized docstrings are written back to the MCP server source files via AST, preserving all surrounding code.
-
-### Skills + Tools Together — `--include-tools` (advanced)
-
-For advanced use: optimize both skill and tool descriptions in a single GEPA run. Both are treated as GEPA components (round-robin mutation). Per-preset metric call caps prevent budget blowup.
+After separately optimizing both, you may find edge cases where the skill and tool description interact poorly. Co-optimization can fix these, but use it surgically on specific tool modules rather than all at once.
 
 ```bash
-# Skill + specific tool modules
-uv run python .test/scripts/optimize.py databricks-metric-views --include-tools --tool-modules sql
+# Co-optimize skill + the SQL tool module only
+uv run python .test/scripts/optimize.py databricks-metric-views --include-tools \
+    --tool-modules sql --preset quick
 
 # Dry run to see all components and their token counts
 uv run python .test/scripts/optimize.py databricks-metric-views --include-tools --dry-run
 ```
 
+**When to use co-optimization**:
+- A skill tells the agent to use a tool in a specific way, but the tool description contradicts it
+- The agent consistently picks the wrong tool for a specific skill's tasks
+- You've already optimized separately and want to squeeze out the last few points
+
+**When NOT to use co-optimization**:
+- As a first step — the confounding variable problem makes results harder to interpret
+- With many tool modules — metric call budgets scale linearly with component count, and round-robin mutation dilutes effort across components
+
+### Summary: Skills vs Tools vs Both
+
+| Mode | Flag | Components | Dataset | Best for |
+|------|------|-----------|---------|----------|
+| Skill only | *(default)* | `skill_md` (1) | Single skill's `ground_truth.yaml` | Teaching domain-specific patterns |
+| Tools only | `--tools-only` | `tools_sql`, `tools_serving`, etc. | Cross-skill (all skills sampled) | Universal tool selection accuracy |
+| Both | `--include-tools` | `skill_md` + tool modules | Single skill's `ground_truth.yaml` | Fixing skill/tool interaction edge cases |
+
 Available tool modules: `agent_bricks`, `aibi_dashboards`, `apps`, `compute`, `file`, `genie`, `jobs`, `lakebase`, `manifest`, `pipelines`, `serving`, `sql`, `unity_catalog`, `user`, `vector_search`, `volume_files`
+
+### Agent-Based Evaluation — `--agent-eval` mode
+
+The default proxy evaluator uses a single-turn `litellm.completion()` call — it tests whether a SKILL.md teaches correct knowledge, but cannot verify tool selection, multi-turn reasoning, or actual tool usage. Agent evaluation runs a **real Claude Code instance** (via [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)) with the candidate SKILL.md injected, then scores the agent's actual behavior.
+
+#### Two modes
+
+| Mode | Flag | What it does | Speed |
+|------|------|-------------|-------|
+| **Hybrid** | `--agent-eval` | Proxy for GEPA iterations, real agent for baseline + final validation | ~12-20 min |
+| **Full agent** | `--agent-eval-full` | Real agent for ALL GEPA iterations | ~30-60 min |
+
+Hybrid mode is recommended — it gives fast GEPA iteration with real agent validation at the start and end.
+
+#### How it works
+
+```
+1. Agent baseline:  Run agent on original SKILL.md (all training tasks)
+2. GEPA loop:       Use fast proxy evaluator for mutations (current speed)
+3. Agent validation: Run agent on best candidate (all training tasks)
+4. Compare:         Report proxy scores vs agent scores side-by-side
+```
+
+The agent evaluator captures streaming events (tool_use, tool_result, text) and builds `TraceMetrics` — the same model used by the JSONL transcript parser. This enables reuse of all existing trace scorers (`required_tools`, `banned_tools`, `tool_count`, etc.).
+
+#### Agent scoring weights
+
+| Weight | Dimension | Source |
+|--------|-----------|--------|
+| **20%** | Content quality | `quality_judge` on final response text |
+| **20%** | Skill effectiveness | WITH vs WITHOUT delta |
+| **20%** | Tool call correctness | MLflow `ToolCallCorrectness` or `required_tools` scorer |
+| **10%** | Tool call efficiency | MLflow `ToolCallEfficiency` or `tool_count` scorer |
+| **15%** | Behavioral compliance | Deterministic trace scorers (required/banned tools, tool sequence) |
+| **10%** | Execution success | Ratio of successful tool calls |
+| **5%** | Token efficiency | Smaller candidates score higher |
+
+#### Usage
+
+```bash
+# Hybrid mode: agent baseline + proxy GEPA + agent validation
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --preset quick
+
+# Dry run with agent baseline scoring (no optimization)
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --dry-run
+
+# Full agent mode (agent for all GEPA iterations — slow but most accurate)
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval-full --preset quick
+
+# Specify which model the agent uses
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval \
+    --agent-model databricks-claude-sonnet-4-6
+
+# Increase timeout for complex tasks (default: 300s)
+uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --agent-timeout 600
+```
+
+#### Prerequisites
+
+```bash
+# Install the agent extra
+uv pip install -e ".test/[agent]"
+
+# Set auth for the Claude agent (same as databricks-builder-app)
+export ANTHROPIC_BASE_URL="https://<workspace>.cloud.databricks.com/serving-endpoints/anthropic"
+export ANTHROPIC_API_KEY="dapi..."
+export ANTHROPIC_MODEL="databricks-claude-sonnet-4-6"
+```
+
+#### `trace_expectations` in ground truth
+
+Test cases can include `trace_expectations` to validate agent tool behavior:
+
+```yaml
+test_cases:
+  - id: metric-views_create_sql_001
+    inputs:
+      prompt: "Create a metric view for order analytics"
+    expectations:
+      expected_facts:
+        - "Uses CREATE OR REPLACE VIEW with WITH METRICS LANGUAGE YAML"
+      trace_expectations:
+        required_tools:
+          - mcp__databricks__execute_sql
+        banned_tools:
+          - Bash  # should use execute_sql, not raw bash for SQL
+        tool_limits:
+          mcp__databricks__execute_sql: 3
+```
+
+These are only evaluated when `--agent-eval` or `--agent-eval-full` is used. Without agent mode, they are ignored.
+
+#### Estimated cost (hybrid mode)
+
+| Phase | Calls | Cost | Time |
+|-------|-------|------|------|
+| Agent baseline (8 tasks x WITH + WITHOUT) | 16 agent runs | ~$4 | ~5-10 min |
+| GEPA proxy iterations (quick preset) | ~350 LLM calls | ~$0 (Databricks) | ~3-4 min |
+| Agent validation (8 tasks x WITH only) | 8 agent runs | ~$2 | ~3-5 min |
+| **Total** | | **~$6** | **~12-20 min** |
 
 ---
 
@@ -471,6 +640,7 @@ uv run python .test/scripts/optimize.py <skill> --preset thorough   # 150 iterat
 --apply-last            # Apply saved result without re-running
 --gen-model "..."       # Override generation model (default: databricks/databricks-claude-sonnet-4-6)
 --reflection-lm "..."   # Override reflection model (default: databricks/databricks-claude-opus-4-6)
+--judge-model "..."     # Override judge model (default: databricks/databricks-claude-sonnet-4-6)
 --max-passes N          # Max optimization passes (default: 5)
 --token-budget N        # Hard token ceiling
 --include-tools         # Include MCP tool descriptions as GEPA components (advanced)
@@ -478,6 +648,12 @@ uv run python .test/scripts/optimize.py <skill> --preset thorough   # 150 iterat
 --tools-only            # Optimize only tool descriptions (cross-skill evaluation)
 --all                   # Optimize all skills with ground_truth.yaml
 --run-dir DIR           # Directory for GEPA checkpoints (resumes if dir exists)
+
+# Agent evaluation
+--agent-eval            # Hybrid: agent for baseline + validation, proxy for GEPA
+--agent-eval-full       # Full agent for ALL GEPA iterations (slow)
+--agent-model "..."     # Model for agent execution (default: ANTHROPIC_MODEL env)
+--agent-timeout N       # Timeout per agent run in seconds (default: 300)
 
 # Test case generation
 --generate-from FILE    # Generate test cases from requirements file
@@ -506,15 +682,27 @@ uv run python .test/scripts/optimize.py <skill> --preset thorough   # 150 iterat
 
 - **`--token-budget`**: Hard ceiling on candidate token count. The efficiency scorer penalizes candidates that exceed this budget. Also available via `GEPA_TOKEN_BUDGET` env var.
 
+- **`--agent-eval`**: Hybrid agent evaluation mode. Runs a real Claude Code agent (via Claude Agent SDK) for baseline scoring before GEPA and validation after GEPA. GEPA iterations still use the fast proxy evaluator. Reports both proxy and agent scores side-by-side. Requires `claude-agent-sdk>=0.1.39` (`uv pip install -e ".test/[agent]"`).
+
+- **`--agent-eval-full`**: Full agent evaluation mode. Uses the real Claude Code agent for **all** GEPA iterations — every mutation is evaluated by running the agent. Most accurate but significantly slower. Use for final validation or when tool selection accuracy matters more than speed.
+
+- **`--agent-model`**: Override which model the Claude Code agent uses (e.g., `databricks-claude-sonnet-4-6`). Defaults to the `ANTHROPIC_MODEL` environment variable. The agent model is independent of `--gen-model` (which controls the proxy evaluator's generation model).
+
+- **`--agent-timeout`**: Maximum time in seconds for a single agent execution (default: 300). Increase for complex tasks that involve multiple tool calls. If an agent exceeds this timeout, the run is marked as failed with a partial trace.
+
 ### Model Configuration
 
 | Env Var | Default | Purpose |
 |---------|---------|---------|
-| `GEPA_GEN_LM` | `databricks/databricks-claude-sonnet-4-6` | Generation model (produces responses from skill) |
+| `GEPA_GEN_LM` | `databricks/databricks-claude-sonnet-4-6` | Generation model (proxy evaluator responses) |
 | `GEPA_REFLECTION_LM` | `databricks/databricks-claude-opus-4-6` | Reflection model (proposes mutations) |
+| `GEPA_JUDGE_LM` | `databricks/databricks-claude-sonnet-4-6` | Judge model (quality/effectiveness scoring) |
 | `GEPA_TOKEN_BUDGET` | none | Hard token ceiling for candidates |
+| `ANTHROPIC_BASE_URL` | none | Claude API base URL for agent evaluation |
+| `ANTHROPIC_API_KEY` | none | Claude API key for agent evaluation |
+| `ANTHROPIC_MODEL` | none | Default model for agent execution |
 
-Model strings use [litellm provider prefixes](https://docs.litellm.ai/docs/providers): `databricks/`, `openai/`, `anthropic/`.
+Proxy evaluator models use [litellm provider prefixes](https://docs.litellm.ai/docs/providers): `databricks/`, `openai/`, `anthropic/`. Agent models use the model name directly (e.g., `databricks-claude-sonnet-4-6`) since they go through the Claude Agent SDK.
 
 ---
 
@@ -600,6 +788,7 @@ The evaluation dataset. Each test case represents a user prompt and the expected
 | `test_cases[].expectations.expected_facts` | yes | List of factual claims the response must contain. The quality judge checks each one. |
 | `test_cases[].expectations.expected_patterns` | no | Regex patterns with fields: `pattern`, `description`, and optionally `min_count` / `max_count`. Checked deterministically. |
 | `test_cases[].expectations.guidelines` | no | Soft rules evaluated by the quality judge for things regex can't check (e.g., "Should explain why SELECT * doesn't work"). |
+| `test_cases[].expectations.trace_expectations` | no | Agent behavioral expectations (only used with `--agent-eval`). See [trace_expectations fields](#trace_expectations-fields) below. |
 | `test_cases[].metadata.category` | recommended | Used for stratified train/val splitting. Common values: `happy_path`, `error_handling`, `advanced`, `conceptual`, `edge_case`. |
 
 **Example with all fields:**
@@ -643,6 +832,33 @@ test_cases:
         - "Should include a complete YAML block between $$ delimiters"
     metadata:
       category: happy_path
+```
+
+#### `trace_expectations` fields
+
+These fields are nested under `expectations.trace_expectations` in each test case and are only evaluated when running with `--agent-eval` or `--agent-eval-full`. They validate the agent's actual tool behavior, not just response text.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `required_tools` | list of str | Tool names that the agent **must** call (e.g., `mcp__databricks__execute_sql`). Failing = score penalty. |
+| `banned_tools` | list of str | Tool names the agent **must not** call (e.g., `Bash` when `execute_sql` should be used). |
+| `tool_limits` | dict of str:int | Maximum number of calls per tool (e.g., `mcp__databricks__execute_sql: 3`). |
+| `tool_sequence` | list of str | Expected order of tool calls. Checks that tools appear and in relative order. |
+
+**Example:**
+
+```yaml
+trace_expectations:
+  required_tools:
+    - mcp__databricks__execute_sql
+  banned_tools:
+    - Bash
+  tool_limits:
+    mcp__databricks__execute_sql: 3
+  tool_sequence:
+    - Read
+    - mcp__databricks__execute_sql
+    - Write
 ```
 
 ### `manifest.yaml` — How to evaluate the skill
@@ -696,10 +912,14 @@ quality_gates:
 │   ├── optimize.py              # CLI entry point
 │   ├── generate_examples.py     # Generate test cases from requirements
 │   └── trace_to_examples.py     # Extract test cases from MLflow traces
+├── src/skill_test/agent/
+│   ├── __init__.py              # Exports AgentResult, run_agent
+│   └── executor.py              # Claude Agent SDK wrapper, event capture, TraceMetrics builder
 ├── src/skill_test/optimize/
 │   ├── judges.py                # MLflow make_judge factories (quality, effectiveness, regression)
-│   ├── skillbench_evaluator.py  # WITH vs WITHOUT evaluator using judges
-│   ├── runner.py                # GEPA optimize_anything orchestrator
+│   ├── skillbench_evaluator.py  # WITH vs WITHOUT evaluator using judges (proxy mode)
+│   ├── agent_evaluator.py       # Agent-based evaluator using Claude Agent SDK
+│   ├── runner.py                # GEPA optimize_anything orchestrator (supports --agent-eval)
 │   ├── utils.py                 # Token counting, path resolution
 │   ├── asi.py                   # MLflow Feedback → side_info conversion
 │   ├── alignment.py             # MemAlign judge alignment (future)
@@ -708,10 +928,10 @@ quality_gates:
 │   └── tools.py                 # MCP tool description extraction
 ├── src/skill_test/scorers/
 │   ├── universal.py             # Deterministic: python_syntax, sql_syntax, etc.
-│   ├── trace.py                 # Trace-based: tool_count, token_budget, etc.
+│   ├── trace.py                 # Trace-based: tool_count, token_budget, required/banned_tools, etc.
 │   └── routing.py               # Skill routing accuracy (deprecated)
 └── skills/<skill-name>/
-    ├── ground_truth.yaml        # Test cases
+    ├── ground_truth.yaml        # Test cases (now supports trace_expectations)
     ├── manifest.yaml            # Scorer configuration
     ├── optimized_SKILL.md       # Last optimization output
     └── last_optimization.json   # Metadata for --apply-last
