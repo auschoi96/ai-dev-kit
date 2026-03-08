@@ -1,510 +1,252 @@
 # Skill Evaluation & Optimization
 
-Automatically evaluate and optimize SKILL.md files using [GEPA](https://github.com/gepa-ai/gepa) `optimize_anything` and MLflow judges.
+Evaluate and optimize SKILL.md files using [GEPA](https://github.com/gepa-ai/gepa) and MLflow judges. Skills teach AI agents how to use Databricks features — this framework measures whether they actually help and uses evolutionary optimization to improve them.
 
-## How It Works
+For a deep technical explanation of the evaluation methodology, scoring, and architecture, see [TECHNICAL.md](TECHNICAL.md).
 
-SKILL.md files teach AI agents (like Claude Code) how to use Databricks features. Every token in a skill consumes the agent's context window, so skills must be **correct** (teach the right patterns) and **concise** (waste no tokens). This framework measures both and uses GEPA to improve them.
+---
 
-### The Core Loop
+## Setup
 
-```
-                  ┌──────────────────────────────────────────────────┐
-                  │                GEPA optimize_anything             │
-                  │                                                   │
-                  │  seed_candidate ─► evaluator(candidate, task)     │
-                  │       │                    │                      │
-                  │       │              (score, side_info)           │
-                  │       │                    │                      │
-                  │       │           reflection LM reads             │
-                  │       │           side_info rationale             │
-                  │       │                    │                      │
-                  │       │              proposes mutation             │
-                  │       │                    │                      │
-                  │       └──── best_candidate (Pareto frontier) ◄───┘│
-                  └──────────────────────────────────────────────────┘
+### 1. Install dependencies
+
+```bash
+# Core + optimization
+uv pip install -e ".test/[all]"
+
+# Agent evaluation only (optional)
+uv pip install -e ".test/[agent]"
 ```
 
-**GEPA** ([Generalized Evolutionary Prompt Architect](https://github.com/gepa-ai/gepa)) treats the SKILL.md as a text artifact to optimize. Its `optimize_anything` API takes:
-- A **seed candidate** (the current SKILL.md text)
-- An **evaluator** function: `(candidate, task_example) -> (score, side_info)`
-- A **dataset** of test cases from `ground_truth.yaml`
+### 2. Configure authentication
 
-GEPA's reflection LM reads the `side_info` diagnostics, proposes mutations, evaluates them, and selects the best via Pareto frontier. The critical insight: the richer the `side_info` diagnostics, the better GEPA's mutations.
+Pick one authentication method for the LLM endpoints used by the evaluator (generation, judging, reflection):
 
-### Evaluation Methodology: How We Measure Skill Quality
+**Databricks AI Gateway (recommended)**
 
-Before understanding the judges and scoring, it's important to understand **what we're measuring and why the measurement is trustworthy**.
-
-#### The core question: "Does this skill actually help?"
-
-A SKILL.md is only valuable if an agent produces **better responses with the skill than without it**. This is a testable claim — we can generate responses both ways and compare. That comparison is the foundation of all evaluation and optimization in this framework.
-
-#### Two layers of comparison
-
-There are two distinct comparisons happening — understanding both is key to reading the scores:
-
-1. **Within each evaluation** (WITH vs WITHOUT skill): measures whether a given SKILL.md adds value over a bare LLM. This is what `quality_with` and `quality_without` refer to.
-2. **Across the optimization loop** (original vs optimized): measures whether GEPA's mutations improved the SKILL.md. This is what `original_score` vs `optimized_score` refer to.
-
-The first comparison runs inside the evaluator on every iteration. The second comparison runs in the runner to decide whether to keep GEPA's changes.
-
-#### The WITH vs WITHOUT experimental design
-
-Every evaluation follows a controlled experiment that measures whether a specific SKILL.md candidate helps the LLM produce better responses:
-
-1. **WITH-skill trial** (`quality_with`) — An LLM generates a response with the SKILL.md injected as system context. The skill teaches the model Databricks-specific patterns, syntax, and constraints it wouldn't otherwise know.
-2. **WITHOUT-skill trial** (`quality_without`) — The **same LLM** generates a response to the **same prompt** with **no SKILL.md in context**. This is the control — it shows what the model already knows on its own. **This is NOT "without optimization"** — it is the bare model with no skill document at all.
-3. **Judge both** — An MLflow judge scores each response against the test case's expected facts, patterns, and guidelines, returning a 0.0-1.0 quality score plus a written rationale.
-
-The WITHOUT-skill response is **computed once and cached by prompt hash** — since the model and prompt don't change, the baseline is stable across all GEPA iterations. This means every candidate SKILL.md is compared against the same fixed control (the bare model).
-
-#### What "baseline score" means
-
-Before optimization begins, the runner evaluates the **original SKILL.md** on all training tasks using the WITH/WITHOUT protocol above. This produces:
-
-- A **per-task score** — the composite score (see [Scoring Weights](#scoring-weights)) for each test case
-- A **mean baseline score** — the average across all tasks (e.g., `0.909`)
-- **Diagnostic labels** — each task is classified:
-  - **OK** — skill helped (quality delta > +0.05)
-  - **NEEDS_SKILL** — WITH-skill quality is below 0.5 (skill isn't teaching enough)
-  - **REGRESSION** — skill actively hurt the response (quality delta < −0.05)
-
-This baseline tells you exactly where the skill stands *before* any optimization.
-
-#### What "improvement" means (the second layer)
-
-This is the **outer comparison** — original SKILL.md vs optimized SKILL.md. After GEPA produces an optimized candidate, it's re-evaluated on all training tasks using the same WITH/WITHOUT protocol. Improvement is the difference between the optimized mean score and the original mean score:
-
-```
-improvement = optimized_score - original_score
+```bash
+export DATABRICKS_API_KEY="dapi..."
+export DATABRICKS_API_BASE="https://<account-id>.ai-gateway.cloud.databricks.com/mlflow/v1/serving-endpoints"
+# MLflow judges and litellm read OPENAI_API_KEY for auth
+export OPENAI_API_KEY="$DATABRICKS_API_KEY"
 ```
 
-Both scores come from the same evaluator, which internally runs the WITH vs WITHOUT comparison. So "improvement" means the optimized SKILL.md produced a larger quality delta (WITH minus WITHOUT) than the original SKILL.md did — i.e., the optimized skill helps the LLM more than the original skill did.
+**Databricks direct**
 
-This is **not** a subjective assessment. Both scores come from the same judges, same prompts, same cached WITHOUT-skill baselines. The only variable is the SKILL.md content.
+```bash
+export DATABRICKS_API_KEY="dapi..."
+export DATABRICKS_API_BASE="https://<workspace>.cloud.databricks.com/serving-endpoints"
+```
 
-The composite score itself is a weighted combination of four dimensions (detailed in [Scoring Weights](#scoring-weights)):
+**OpenAI**
 
-| Dimension | What it measures | Why it matters |
-|-----------|-----------------|----------------|
-| **Skill Effectiveness (40%)** | `quality_with - quality_without` | The skill's unique contribution — what the model gets right *because* of the skill |
-| **Absolute Quality (30%)** | `quality_with` score | Overall response quality with the skill present |
-| **Structure (5%)** | Python/SQL syntax validity | Code in the skill must be syntactically correct |
-| **Token Efficiency (25%)** | Token count vs original | Smaller skills save context window — candidates that shrink get a bonus up to 1.15x |
+```bash
+export OPENAI_API_KEY="sk-..."
+export GEPA_REFLECTION_LM="openai/gpt-4o"
+export GEPA_GEN_LM="openai/gpt-4o"
+```
 
-A skill that scores 0.91 after optimization vs 0.88 at baseline has a measurable, reproducible improvement of +0.03 — driven by higher quality deltas, fewer regressions, or better token efficiency.
+### 3. Configure the Claude Code agent (for `--agent-eval`)
 
-#### Why this is rigorous, not made up
+Agent evaluation runs a real Claude Code instance via the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python). The agent's environment is configured in `.test/claude_agent_settings.json`:
 
-- **Same model, same prompts** — the only variable is the skill content, isolating its effect
-- **Cached baselines** — WITHOUT-skill responses don't change between iterations, so score deltas are real
-- **Judge rationale** — every score comes with a written explanation of which facts were present/missing and which patterns matched/failed, making scores auditable
-- **Train/val split** — with 5+ test cases, stratified splitting prevents overfitting to the training set
-- **Deterministic structure checks** — syntax validation and pattern adherence use regex/AST parsing, not LLM judgment
-
-### MLflow Judges as the Evaluator
-
-The evaluator uses [MLflow's `make_judge`](https://mlflow.org/docs/latest/llms/llm-evaluate/index.html) to score responses. Two judges run by default during optimization:
-
-| Judge | What it does | Returns |
-|-------|-------------|---------|
-| **quality_judge** | Scores a single response against expected facts, patterns, and guidelines | `float` (0.0-1.0) + rationale |
-| **regression_judge** | Identifies specific ways the skill harms responses | `bool` + rationale of what to fix |
-
-Effectiveness is derived from the quality delta (`quality_with - quality_without`) — no separate LLM call needed. The `effectiveness_judge` is available in `judges.py` for standalone use but is not called during optimization.
-
-Each judge returns **full rationale** — not truncated — so GEPA's reflection LM sees exactly what failed and why:
-
-```python
-side_info = {
-    "Judge_quality_with": {
-        "score": 0.65,
-        "rationale": "The response correctly uses CREATE OR REPLACE VIEW but misses "
-                     "the MEASURE() wrapping requirement for measure references. "
-                     "Pattern adherence: 2/3 found. Fact coverage: 3/5 present."
-    },
-    "Judge_quality_without": {
-        "score": 0.2,
-        "rationale": "Without the skill, the model invented a non-existent "
-                     "CREATE METRIC VIEW syntax. Only 1/5 expected facts present."
-    },
-    "Judge_effectiveness": {
-        "verdict": "improved",
-        "delta": 0.45,
+```json
+{
+    "env": {
+        "ANTHROPIC_MODEL": "databricks-claude-opus-4-6",
+        "ANTHROPIC_BASE_URL": "https://<account-id>.ai-gateway.cloud.databricks.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "${DATABRICKS_TOKEN:-dapi...}",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-6",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-4-6",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+        "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        "DATABRICKS_CONFIG_PROFILE": "${DATABRICKS_CONFIG_PROFILE:-e2-demo-field-eng}",
+        "DATABRICKS_API_KEY": "${DATABRICKS_TOKEN:-dapi...}"
     }
 }
 ```
 
-### How Baseline Evaluation Works
+| Field | Purpose |
+|-------|---------|
+| `ANTHROPIC_MODEL` | Default model the agent uses |
+| `ANTHROPIC_BASE_URL` | Claude API endpoint (Databricks AI Gateway or direct) |
+| `ANTHROPIC_AUTH_TOKEN` | Auth token — supports `${VAR:-default}` interpolation |
+| `ANTHROPIC_CUSTOM_HEADERS` | Extra headers (e.g., coding agent mode for Databricks) |
+| `DATABRICKS_CONFIG_PROFILE` | Databricks CLI profile for MCP tools |
+| `DATABRICKS_API_KEY` | Databricks token for MCP tool calls |
 
-This section walks through how a single test case is evaluated end-to-end, from dataset loading through to the baseline score that GEPA uses for optimization.
-
-#### 1. Dataset Loading (`splitter.py`)
-
-- Loads `ground_truth.yaml` test cases via `create_gepa_datasets()`
-- If >= 5 test cases: stratified train/val split by `metadata.category` (80/20 default)
-- If < 5: all used as train, no val set (single-task mode)
-- If no `ground_truth.yaml` exists: `generate_bootstrap_tasks()` auto-generates tasks from SKILL.md headers
-
-#### 2. Evaluator Construction (`skillbench_evaluator.py`)
-
-`create_skillbench_evaluator()` builds a `SkillBenchEvaluator` with:
-
-| Parameter | Purpose |
-|-----------|---------|
-| `gen_model` | LLM that generates responses (plays the role of the agent) |
-| `original_token_counts` | Token count of the original SKILL.md (for efficiency scoring) |
-| `skill_guidelines` | Deduplicated guidelines from all test cases (injected into quality judge) |
-| `tool_context` | Read-only MCP tool descriptions (included in generation prompt but not mutated) |
-
-The evaluator instantiates two MLflow judges: `quality_judge` and `regression_judge`.
-
-#### 3. Per-Task Evaluation Flow (the `__call__` method)
-
-Each test case goes through four phases:
-
-1. **Phase 1: WITH-skill generation** -- Sends the SKILL.md + tool descriptions as system context, user prompt as user message, generates response at temperature=0
-2. **Phase 2: WITHOUT-skill generation** -- Same prompt, NO skill in context. Result is **cached by prompt hash** -- computed once and reused across all GEPA iterations (the baseline never changes)
-3. **Phase 3: Judge scoring** -- `quality_judge` scores both responses against `expected_facts`, `expected_patterns`, and `guidelines` from the test case. WITHOUT-skill judge results are also cached.
-4. **Phase 4: Compute composite score** -- Weighted combination of effectiveness delta, absolute quality, structure validation, and token efficiency
-
-#### 4. Baseline Scoring (`runner.py` step 5)
-
-Before optimization starts, `_evaluate_on_tasks()` runs the evaluator on ALL training tasks with the original SKILL.md:
-
-- Collects per-task scores and `side_info` diagnostics
-- `build_skillbench_background()` summarizes: mean baseline score, which tasks are NEEDS_SKILL vs REGRESSION
-- This baseline context tells GEPA's reflection LM what's already working and what needs improvement
-
-#### 5. Why This Matters for GEPA
-
-- The `side_info` dict returned per-task contains **full judge rationale** (not truncated)
-- GEPA's reflection LM reads this rationale to understand exactly what failed
-- Better diagnostics lead to more targeted mutations and faster convergence
-
-### Scoring Weights
-
-| Weight | Dimension | Source |
-|--------|-----------|--------|
-| **40%** | Skill Effectiveness | `quality_with - quality_without` (the delta) |
-| **30%** | Absolute Quality | `quality_with` score from judge |
-| **5%** | Structure | Python/SQL syntax validation |
-| **25%** | Token Efficiency | Smaller = higher score (bonus up to 1.15x) |
-
-### How Multi-Pass Optimization Works
-
-Optimization runs as a multi-pass loop where each pass feeds its best result into the next. This section explains what happens inside a single pass and how the runner decides when to stop.
-
-#### What happens inside a single GEPA pass
-
-GEPA's `optimize_anything` receives the seed candidate (current SKILL.md text), the evaluator, the training dataset, and the preset config. Within a pass, GEPA runs up to `max_metric_calls` iterations — **15** for `quick`, **50** for `standard`, **150** for `thorough`.
-
-Each iteration follows this cycle:
-
-1. **Reflect** — The reflection LM reads `side_info` from the previous evaluation. This includes the full judge rationale: which expected facts were missing, which regex patterns weren't found, which guidelines were violated, and whether regressions occurred.
-2. **Mutate** — Based on the rationale, the reflection LM proposes a targeted mutation to the SKILL.md (or tool docstring). Mutations are surgical — informed by exactly what the judges flagged.
-3. **Evaluate** — The evaluator scores the mutated candidate on a task from the dataset. This involves generating responses WITH the candidate, running MLflow judges, and computing the composite score.
-4. **Select** — GEPA tracks a Pareto frontier of best candidates. If the mutation improves the frontier, it's kept; otherwise, it's discarded.
-
-The key insight: because `side_info` contains **full judge rationale** (not truncated summaries), the reflection LM sees exactly which facts were missed, which patterns were absent, and which regressions occurred — leading to more targeted mutations.
-
-#### How multi-pass works and when it stops
-
-The runner (`runner.py`) wraps GEPA in a multi-pass loop (default: up to 5 passes, controlled by `--max-passes`):
-
-1. **Pass N starts** — The best candidate from pass N-1 (or the original SKILL.md for pass 1) becomes the seed.
-2. **GEPA optimizes** — Runs up to `max_metric_calls` iterations within the pass.
-3. **Re-evaluate** — After the pass completes, the best candidate is re-evaluated on **all** training tasks to get a stable score.
-4. **Compare** — The pass score is compared to the previous best score.
-5. **Decision:**
-   - If improvement > **0.0005** (the `improvement_threshold`): the best candidate becomes the seed for pass N+1, and optimization continues.
-   - If improvement ≤ **0.0005**: early stop — no further passes are run.
-
-This creates a refinement chain: each pass starts from the previous pass's best, allowing incremental improvements that compound across passes. Early stopping prevents wasting compute when the skill has converged.
-
-#### Component scaling
-
-When optimizing multiple components (e.g., SKILL.md + tool modules with `--include-tools`), metric calls scale:
-
-- **Base formula:** `base_calls × num_components`
-- **Per-preset caps:** quick → 45, standard → 150, thorough → 300
-- **Global cap:** 300 (applied for slower reflection models)
-- **Round-robin:** GEPA's component selector alternates which component to mutate each iteration, so all components get roughly equal optimization effort.
-
-For example, with `--include-tools --tool-modules sql serving` (3 components: `skill_md` + `tools_sql` + `tools_serving`), a `quick` preset uses min(15 × 3, 45) = **45** metric calls per pass.
+The `${VAR:-default}` syntax lets you reference environment variables with fallbacks. The agent runs with `bypassPermissions` mode so it doesn't prompt for tool approval.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install
-uv pip install -e ".test/[all]"
+# Check baseline scores (no optimization)
+uv run python .test/scripts/optimize.py databricks-metric-views --dry-run
 
-# Auth (pick one)
-export DATABRICKS_API_KEY="dapi..."
-export DATABRICKS_API_BASE="https://<workspace>.cloud.databricks.com/serving-endpoints"
-# OR
-export OPENAI_API_KEY="sk-..."
-export GEPA_REFLECTION_LM="openai/gpt-4o"
-export GEPA_GEN_LM="openai/gpt-4o"
-
-# OR use Databricks AI Gateway (routes through a centralized gateway with rate limits and logging)
-export DATABRICKS_API_KEY="dapi..."
-export DATABRICKS_API_BASE="https://<account-id>.ai-gateway.cloud.databricks.com/mlflow/v1/serving-endpoints"
-# IMPORTANT: When using AI Gateway, OPENAI_API_KEY must also be set to your Databricks API token.
-# The MLflow judges and litellm call OpenAI-compatible endpoints, which read OPENAI_API_KEY for auth.
-export OPENAI_API_KEY="$DATABRICKS_API_KEY"
-
-# Optimize
-uv run python .test/scripts/optimize.py databricks-metric-views --preset quick --apply
-```
-
----
-
-## What Can Be Optimized
-
-GEPA treats any text artifact as a candidate for optimization. There are two distinct text artifacts that influence how Claude Code handles Databricks tasks, and they serve fundamentally different roles:
-
-| Artifact | Where it lives | What it controls | Scope |
-|----------|---------------|-----------------|-------|
-| **SKILL.md** | `databricks-skills/<skill>/SKILL.md` | Domain knowledge: API syntax, code patterns, best practices, constraints | One skill = one domain (e.g., metric views, SDP pipelines) |
-| **Tool descriptions** | `databricks-mcp-server/tools/*.py` (`@mcp.tool` docstrings) | Tool selection: what each MCP tool does, when to use it, what arguments it takes | Shared across ALL skills — every agent session sees the same tool descriptions |
-
-Understanding the difference is key to choosing the right optimization approach.
-
-### Why optimize skills and tools separately
-
-Skills and tools operate at different layers of the agent's decision-making:
-
-1. **Tools determine *what* the agent does** — Tool descriptions are what Claude reads to decide which MCP tool to call. If `execute_sql`'s description says "Run SQL queries", the agent might use it for everything. If it says "Execute read/write SQL statements on Databricks SQL warehouses", the agent makes better choices about when to use it vs Bash vs other tools.
-
-2. **Skills determine *how* the agent does it** — SKILL.md files teach the agent domain-specific patterns it wouldn't otherwise know. A metric views skill teaches `WITH METRICS LANGUAGE YAML` syntax; an SDP skill teaches `CREATE OR REFRESH STREAMING TABLE` patterns.
-
-3. **Tools are shared, skills are scoped** — This is the critical distinction. Tool descriptions are seen by every agent session regardless of which skill is active. If you optimize a tool description to work well for metric views tasks, you might make it worse for SDP or model serving tasks. Skills, by contrast, are only loaded when their domain is relevant.
-
-This creates a **confounding variable problem** when optimizing them together. If GEPA mutates both the skill and a tool description in the same run:
-- Did the score improve because the skill got better, or because the tool description changed?
-- Will the tool description change break other skills that depend on it?
-- GEPA's reflection LM can't distinguish which component caused the improvement.
-
-Optimizing separately isolates the variables:
-- **Skill optimization** (default mode): holds tool descriptions fixed as read-only context, mutates only the SKILL.md. Improvements are attributable to better domain knowledge.
-- **Tool optimization** (`--tools-only`): holds skills fixed, mutates only tool docstrings. Uses a cross-skill dataset to ensure changes work universally, not just for one domain.
-
-### Recommended optimization workflow
-
-The recommended order addresses the dependency chain — tools are the foundation, skills build on top.
-
-#### Step 1: Optimize tools first (universal, cross-skill)
-
-Tool descriptions are the foundation. An agent can't use the right tool if it doesn't understand what the tools do, regardless of how good the skill is. Optimize tools against a diverse cross-skill dataset so they generalize.
-
-```bash
-# See what modules exist and their token counts
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --dry-run
-
-# Optimize all tool descriptions (cross-skill evaluation)
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --preset quick
-
-# Or optimize specific modules (e.g., SQL tools are most impactful)
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only \
-    --tool-modules sql serving compute --preset quick
-
-# Review and apply
-uv run python .test/scripts/optimize.py databricks-metric-views --tools-only --apply-last
-```
-
-**What to look for**: The cross-skill dataset samples tasks from ALL skills with `ground_truth.yaml`. Watch for regressions where improving one skill's tool usage hurts another. The `--dry-run` output shows per-task scores broken down by source skill.
-
-**Validate with agent eval**: After applying tool changes, run `--agent-eval --dry-run` on a few skills to verify the agent actually picks the right tools:
-
-```bash
-# Check that metric views tasks still use manage_metric_views, not Bash
-uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --dry-run
-
-# Check that SDP tasks still use execute_sql, not Bash
-uv run python .test/scripts/optimize.py databricks-spark-declarative-pipelines --agent-eval --dry-run
-```
-
-#### Step 2: Optimize skills (per-skill, domain-specific)
-
-With stable tool descriptions as the foundation, optimize each skill's SKILL.md. The evaluator loads the (now-optimized) tool descriptions as read-only context, so the skill is evaluated in a realistic environment.
-
-```bash
-# Optimize a specific skill
+# Optimize with a quick pass (15 iterations)
 uv run python .test/scripts/optimize.py databricks-metric-views --preset quick
-
-# With agent validation to verify tool behavior
-uv run python .test/scripts/optimize.py databricks-metric-views --preset quick --agent-eval
-
-# Optimize all skills sequentially
-uv run python .test/scripts/optimize.py --all --preset quick
 
 # Optimize and immediately apply
 uv run python .test/scripts/optimize.py databricks-metric-views --preset quick --apply
+
+# Review a previous run's output, then apply
+diff databricks-skills/databricks-metric-views/SKILL.md \
+     .test/skills/databricks-metric-views/optimized_SKILL.md
+uv run python .test/scripts/optimize.py databricks-metric-views --apply-last
 ```
 
-**What to look for**: The per-task `side_info` shows exactly which expected facts the skill teaches and which it misses. The `Judge_quality_with` rationale explains scoring in detail. With `--agent-eval`, you also see which tools the agent called and whether they succeeded.
-
-#### Step 3 (optional): Co-optimize skills + tools (`--include-tools`)
-
-After separately optimizing both, you may find edge cases where the skill and tool description interact poorly. Co-optimization can fix these, but use it surgically on specific tool modules rather than all at once.
+### With agent evaluation
 
 ```bash
-# Co-optimize skill + the SQL tool module only
-uv run python .test/scripts/optimize.py databricks-metric-views --include-tools \
-    --tool-modules sql --preset quick
-
-# Dry run to see all components and their token counts
-uv run python .test/scripts/optimize.py databricks-metric-views --include-tools --dry-run
-```
-
-**When to use co-optimization**:
-- A skill tells the agent to use a tool in a specific way, but the tool description contradicts it
-- The agent consistently picks the wrong tool for a specific skill's tasks
-- You've already optimized separately and want to squeeze out the last few points
-
-**When NOT to use co-optimization**:
-- As a first step — the confounding variable problem makes results harder to interpret
-- With many tool modules — metric call budgets scale linearly with component count, and round-robin mutation dilutes effort across components
-
-### Summary: Skills vs Tools vs Both
-
-| Mode | Flag | Components | Dataset | Best for |
-|------|------|-----------|---------|----------|
-| Skill only | *(default)* | `skill_md` (1) | Single skill's `ground_truth.yaml` | Teaching domain-specific patterns |
-| Tools only | `--tools-only` | `tools_sql`, `tools_serving`, etc. | Cross-skill (all skills sampled) | Universal tool selection accuracy |
-| Both | `--include-tools` | `skill_md` + tool modules | Single skill's `ground_truth.yaml` | Fixing skill/tool interaction edge cases |
-
-Available tool modules: `agent_bricks`, `aibi_dashboards`, `apps`, `compute`, `file`, `genie`, `jobs`, `lakebase`, `manifest`, `pipelines`, `serving`, `sql`, `unity_catalog`, `user`, `vector_search`, `volume_files`
-
-### Agent-Based Evaluation — `--agent-eval` mode
-
-The default proxy evaluator uses a single-turn `litellm.completion()` call — it tests whether a SKILL.md teaches correct knowledge, but cannot verify tool selection, multi-turn reasoning, or actual tool usage. Agent evaluation runs a **real Claude Code instance** (via [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)) with the candidate SKILL.md injected, then scores the agent's actual behavior.
-
-#### Two modes
-
-| Mode | Flag | What it does | Speed |
-|------|------|-------------|-------|
-| **Hybrid** | `--agent-eval` | Proxy for GEPA iterations, real agent for baseline + final validation | ~12-20 min |
-| **Full agent** | `--agent-eval-full` | Real agent for ALL GEPA iterations | ~30-60 min |
-
-Hybrid mode is recommended — it gives fast GEPA iteration with real agent validation at the start and end.
-
-#### How it works
-
-```
-1. Agent baseline:  Run agent on original SKILL.md (all training tasks)
-2. GEPA loop:       Use fast proxy evaluator for mutations (current speed)
-3. Agent validation: Run agent on best candidate (all training tasks)
-4. Compare:         Report proxy scores vs agent scores side-by-side
-```
-
-The agent evaluator captures streaming events (tool_use, tool_result, text) and builds `TraceMetrics` — the same model used by the JSONL transcript parser. This enables reuse of all existing trace scorers (`required_tools`, `banned_tools`, `tool_count`, etc.).
-
-#### Agent scoring weights
-
-| Weight | Dimension | Source |
-|--------|-----------|--------|
-| **20%** | Content quality | `quality_judge` on final response text |
-| **20%** | Skill effectiveness | WITH vs WITHOUT delta |
-| **20%** | Tool call correctness | MLflow `ToolCallCorrectness` or `required_tools` scorer |
-| **10%** | Tool call efficiency | MLflow `ToolCallEfficiency` or `tool_count` scorer |
-| **15%** | Behavioral compliance | Deterministic trace scorers (required/banned tools, tool sequence) |
-| **10%** | Execution success | Ratio of successful tool calls |
-| **5%** | Token efficiency | Smaller candidates score higher |
-
-#### Usage
-
-```bash
-# Hybrid mode: agent baseline + proxy GEPA + agent validation
+# Hybrid: agent for baseline + validation, proxy for GEPA iterations
 uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --preset quick
 
-# Dry run with agent baseline scoring (no optimization)
+# Dry run with agent baseline scoring
 uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --dry-run
 
-# Full agent mode (agent for all GEPA iterations — slow but most accurate)
+# Full agent mode (agent for ALL iterations — slow but most accurate)
 uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval-full --preset quick
-
-# Specify which model the agent uses
-uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval \
-    --agent-model databricks-claude-sonnet-4-6
-
-# Increase timeout for complex tasks (default: 300s)
-uv run python .test/scripts/optimize.py databricks-metric-views --agent-eval --agent-timeout 600
 ```
 
-#### Prerequisites
+### With MLflow assessment feedback
 
 ```bash
-# Install the agent extra
-uv pip install -e ".test/[agent]"
-
-# Set auth for the Claude agent (same as databricks-builder-app)
-export ANTHROPIC_BASE_URL="https://<workspace>.cloud.databricks.com/serving-endpoints/anthropic"
-export ANTHROPIC_API_KEY="dapi..."
-export ANTHROPIC_MODEL="databricks-claude-sonnet-4-6"
+# Inject real-world behavioral feedback from an MLflow experiment
+uv run python .test/scripts/optimize.py databricks-metric-views \
+    --mlflow-assessments <EXPERIMENT_ID> --preset quick
 ```
 
-#### `trace_expectations` in ground truth
+### Tool optimization
 
-Test cases can include `trace_expectations` to validate agent tool behavior:
+`--tools-only` runs a single global optimization pass using a cross-skill dataset. No per-skill loop is needed — tool descriptions are shared across all skills.
 
-```yaml
-test_cases:
-  - id: metric-views_create_sql_001
-    inputs:
-      prompt: "Create a metric view for order analytics"
-    expectations:
-      expected_facts:
-        - "Uses CREATE OR REPLACE VIEW with WITH METRICS LANGUAGE YAML"
-      trace_expectations:
-        required_tools:
-          - mcp__databricks__execute_sql
-        banned_tools:
-          - Bash  # should use execute_sql, not raw bash for SQL
-        tool_limits:
-          mcp__databricks__execute_sql: 3
+```bash
+# Optimize all tool descriptions (single global pass)
+uv run python .test/scripts/optimize.py --tools-only --preset quick
+
+# Optimize specific tool modules only
+uv run python .test/scripts/optimize.py --tools-only --tool-modules sql serving --preset quick
+
+# Limit tasks per skill (useful with --agent-eval to reduce cost)
+uv run python .test/scripts/optimize.py --tools-only --tool-modules sql --max-per-skill 2 --preset quick
+
+# Dry run — score baseline without optimizing
+uv run python .test/scripts/optimize.py --tools-only --preset quick --dry-run
+
+# --all is accepted but has no effect (tools-only always runs a single pass)
+uv run python .test/scripts/optimize.py --tools-only --all --preset quick
+
+# Co-optimize skill + tool descriptions (per-skill, not global)
+uv run python .test/scripts/optimize.py databricks-metric-views --include-tools \
+    --tool-modules sql --preset quick
 ```
 
-These are only evaluated when `--agent-eval` or `--agent-eval-full` is used. Without agent mode, they are ignored.
+#### Cross-skill dataset filtering with `--tool-modules`
 
-#### Estimated cost (hybrid mode)
+When `--tool-modules` is specified, both tool stats and the cross-skill dataset are filtered:
 
-| Phase | Calls | Cost | Time |
-|-------|-------|------|------|
-| Agent baseline (8 tasks x WITH + WITHOUT) | 16 agent runs | ~$4 | ~5-10 min |
-| GEPA proxy iterations (quick preset) | ~350 LLM calls | ~$0 (Databricks) | ~3-4 min |
-| Agent validation (8 tasks x WITH only) | 8 agent runs | ~$2 | ~3-5 min |
-| **Total** | | **~$6** | **~12-20 min** |
+- **Tool stats** report only the requested modules (e.g., `Tool modules: 1, tools: 5` for `--tool-modules sql`).
+- **Cross-skill dataset** includes only skills whose `tool_modules` in `manifest.yaml` overlap with the requested modules. Skills that *don't declare* `tool_modules` are always included as a safe fallback (e.g., `databricks-config`, `databricks-docs`). This means the dataset won't shrink to *only* SQL skills — general-purpose skills without the field are kept so the evaluator still has broad coverage.
+
+To reduce the dataset further, add `tool_modules` to any remaining skills that should be excluded for certain module filters. Without `--tool-modules`, all skills are included regardless (no regression).
+
+### Optimize all skills
+
+```bash
+uv run python .test/scripts/optimize.py --all --preset quick
+```
 
 ---
 
-## Example Workflow: `databricks-metric-views`
+## CLI Reference
 
-This walks through the full lifecycle of evaluating and optimizing the metric views skill.
+```
+uv run python .test/scripts/optimize.py <skill_name> [options]
+```
 
-### 1. Inspect the skill and test cases
+### Core Options
 
-The skill lives at `databricks-skills/databricks-metric-views/SKILL.md`. Test cases live at `.test/skills/databricks-metric-views/ground_truth.yaml`:
+| Flag | Description |
+|------|-------------|
+| `--preset quick\|standard\|thorough` | Optimization budget: 15 / 50 / 150 iterations per pass (default: `standard`) |
+| `--dry-run` | Score baseline without optimizing |
+| `--apply` | Optimize and immediately apply the result |
+| `--apply-last` | Apply a previously saved result without re-running |
+| `--all` | Optimize all skills that have `ground_truth.yaml` |
+| `--max-passes N` | Max optimization passes (default: 5). Early stops if improvement < 0.0005 |
+| `--max-metric-calls N` | Override auto-scaled metric calls per pass |
+| `--token-budget N` | Hard token ceiling — candidates over this are penalized |
+| `--run-dir DIR` | Checkpoint directory. Resumes from last state if dir exists |
+
+### Model Selection
+
+| Flag | Env Var | Default | Purpose |
+|------|---------|---------|---------|
+| `--gen-model` | `GEPA_GEN_LM` | `databricks/databricks-claude-sonnet-4-6` | Generates responses in proxy evaluator |
+| `--reflection-lm` | `GEPA_REFLECTION_LM` | `databricks/databricks-claude-opus-4-6` | GEPA's reflection/mutation model |
+| `--judge-model` | `GEPA_JUDGE_LM` | `databricks/databricks-claude-sonnet-4-6` | MLflow quality/regression judges |
+
+Proxy evaluator models use [litellm provider prefixes](https://docs.litellm.ai/docs/providers): `databricks/`, `openai/`, `anthropic/`.
+
+### Tool Optimization
+
+| Flag | Description |
+|------|-------------|
+| `--include-tools` | Include MCP tool docstrings as GEPA components alongside SKILL.md |
+| `--tools-only` | Optimize only tool descriptions in a single global pass (no per-skill loop) |
+| `--tool-modules sql serving ...` | Limit which tool modules are optimized (default: all) |
+| `--max-per-skill N` | Max tasks per skill in the cross-skill dataset for `--tools-only` (default: 5) |
+
+Available modules: `agent_bricks`, `aibi_dashboards`, `apps`, `compute`, `file`, `genie`, `jobs`, `lakebase`, `manifest`, `pipelines`, `serving`, `sql`, `unity_catalog`, `user`, `vector_search`, `volume_files`
+
+### Agent Evaluation
+
+| Flag | Description |
+|------|-------------|
+| `--agent-eval` | Hybrid mode: real agent for baseline + validation, proxy for GEPA |
+| `--agent-eval-full` | Real agent for ALL GEPA iterations (slow but most accurate) |
+| `--agent-model MODEL` | Model for agent (default: `ANTHROPIC_MODEL` env var) |
+| `--agent-timeout N` | Timeout per agent run in seconds (default: 300) |
+| `--mlflow-experiment NAME` | MLflow experiment for agent traces (default: `/Shared/skill-tests`) |
+
+### MLflow Feedback
+
+| Flag | Description |
+|------|-------------|
+| `--mlflow-assessments EXPERIMENT_ID` | Fetch `ToolCallCorrectness` / `ToolCallEfficiency` assessments from an MLflow experiment and inject them into GEPA's reflection context |
+
+### Test Case Generation
+
+| Flag | Description |
+|------|-------------|
+| `--generate-from FILE` | Generate test cases from a requirements file before optimizing |
+| `--requirement "..."` | Inline requirement (repeatable) |
+
+---
+
+## Writing Test Cases
+
+Test cases live at `.test/skills/<skill-name>/ground_truth.yaml`. Each test case defines what the skill should teach.
 
 ```yaml
+metadata:
+  skill_name: databricks-metric-views
+  version: "1.0"
+
 test_cases:
   - id: metric-views_create_sql_001
     inputs:
-      prompt: "Create a metric view for order analytics with revenue and order count measures"
+      prompt: "Create a metric view for order analytics with revenue measures"
     outputs:
-      response: |
+      response: |  # Optional reference answer (not exact-matched)
         ```sql
         CREATE OR REPLACE VIEW main.default.order_metrics
         WITH METRICS LANGUAGE YAML
         $$
         source: main.default.orders
-        dimensions:
-          - name: Order Month
-            expr: DATE_TRUNC('MONTH', order_date)
         measures:
           - name: Total Revenue
             expr: SUM(amount)
@@ -513,7 +255,6 @@ test_cases:
     expectations:
       expected_facts:
         - "Uses CREATE OR REPLACE VIEW with WITH METRICS LANGUAGE YAML"
-        - "Defines dimensions with name and expr fields"
         - "Defines measures with name and expr using aggregate functions"
       expected_patterns:
         - pattern: "WITH METRICS LANGUAGE YAML"
@@ -522,416 +263,76 @@ test_cases:
           description: "MEASURE() function for querying"
       guidelines:
         - "Must use WITH METRICS LANGUAGE YAML syntax"
-        - "Must define dimensions and measures in YAML block"
-
-  - id: metric-views_query_measure_002
-    inputs:
-      prompt: "Query a metric view to get total revenue and order count by month"
-    expectations:
-      expected_facts:
-        - "Uses MEASURE() function to reference measures"
-        - "SELECT * is NOT supported on metric views"
-      expected_patterns:
-        - pattern: "MEASURE\\("
-          description: "MEASURE() wrapping for measures"
-        - pattern: "GROUP BY ALL"
-          description: "GROUP BY ALL for metric view queries"
-```
-
-Each test case defines:
-- **`inputs.prompt`** — what the user asks
-- **`expectations.expected_facts`** — facts the response must mention
-- **`expectations.expected_patterns`** — regex patterns the response must contain
-- **`expectations.guidelines`** — soft rules for the MLflow quality judge
-
-### 2. Dry run to check baseline
-
-```bash
-uv run python .test/scripts/optimize.py databricks-metric-views --dry-run
-```
-
-```
-=== Dry Run: databricks-metric-views (skillbench) ===
-SKILL.md path: databricks-skills/databricks-metric-views/SKILL.md
-Components: ['skill_md']
-Total original tokens: 1,234
-  skill_md: 1,234 tokens
-Tool context (read-only): 16,757 tokens
-Train tasks: 8
-Evaluator: skillbench (judge-driven)
-Preset: quick (max_metric_calls=15, scaled for 1 component(s))
-Current score: 0.909
-  metric-views_create_sql_001:     0.952
-  metric-views_query_measure_002:  0.871
-  metric-views_create_mcp_003:     0.934
-  ...
-```
-
-The evaluator runs each test case **twice** — once WITH the skill in context and once WITHOUT — then judges the delta. Test case 002 scores lower because the MEASURE() wrapping example in the skill has a syntax gap.
-
-### 3. Run optimization
-
-```bash
-uv run python .test/scripts/optimize.py databricks-metric-views --preset quick
-```
-
-GEPA runs 15 iterations per component across up to 5 passes. Each iteration:
-1. Mutates the SKILL.md based on judge rationale
-2. Generates responses WITH the mutated skill
-3. Judges score the responses
-4. GEPA keeps mutations that improve the Pareto frontier
-
-```
-  Starting multi-pass optimization (up to 5 passes, 1 component(s), 15 metric calls/pass)
-
-  --- Pass 1/5 (best score so far: 0.9090) ---
-  Pass 1 score: 0.9350 (delta: +0.0260)
-
-  --- Pass 2/5 (best score so far: 0.9350) ---
-  No significant improvement in pass 2 -- stopping early.
-```
-
-### 4. Review and apply
-
-```
-============================================================
-  Optimization Results: databricks-metric-views
-============================================================
-  Score:              0.909 -> 0.935 (+0.026)
-  Skill Effectiveness: 0.42
-  Quality (with):      0.78
-  Quality (without):   0.36 (baseline)
-  Tokens:   1,234 -> 1,198 (-2.9%)
-
-  Per-task:
-    metric-views_create_sql_001     WITH 0.85  WITHOUT 0.35  delta +0.50  [OK]
-    metric-views_query_measure_002  WITH 0.79  WITHOUT 0.22  delta +0.57  [OK]
-    ...
-
-  Saved: .test/skills/databricks-metric-views/optimized_SKILL.md
-  Apply: uv run python .test/scripts/optimize.py databricks-metric-views --apply-last
-============================================================
-```
-
-Review the diff, then apply:
-
-```bash
-# Review what changed
-diff databricks-skills/databricks-metric-views/SKILL.md \
-     .test/skills/databricks-metric-views/optimized_SKILL.md
-
-# Apply
-uv run python .test/scripts/optimize.py databricks-metric-views --apply-last
-```
-
----
-
-## CLI Reference
-
-```bash
-# Presets
-uv run python .test/scripts/optimize.py <skill> --preset quick      # 15 iterations
-uv run python .test/scripts/optimize.py <skill> --preset standard   # 50 iterations (default)
-uv run python .test/scripts/optimize.py <skill> --preset thorough   # 150 iterations
-
-# Options
---dry-run               # Show scores without optimizing
---apply                 # Run + apply immediately
---apply-last            # Apply saved result without re-running
---gen-model "..."       # Override generation model (default: databricks/databricks-claude-sonnet-4-6)
---reflection-lm "..."   # Override reflection model (default: databricks/databricks-claude-opus-4-6)
---judge-model "..."     # Override judge model (default: databricks/databricks-claude-sonnet-4-6)
---max-passes N          # Max optimization passes (default: 5)
---token-budget N        # Hard token ceiling
---include-tools         # Include MCP tool descriptions as GEPA components (advanced)
---tool-modules sql ...  # Specific tool modules to include
---tools-only            # Optimize only tool descriptions (cross-skill evaluation)
---all                   # Optimize all skills with ground_truth.yaml
---run-dir DIR           # Directory for GEPA checkpoints (resumes if dir exists)
-
-# Agent evaluation
---agent-eval            # Hybrid: agent for baseline + validation, proxy for GEPA
---agent-eval-full       # Full agent for ALL GEPA iterations (slow)
---agent-model "..."     # Model for agent execution (default: ANTHROPIC_MODEL env)
---agent-timeout N       # Timeout per agent run in seconds (default: 300)
-
-# Test case generation
---generate-from FILE    # Generate test cases from requirements file
---requirement "..."     # Inline requirement (repeatable)
-```
-
-### Flag Details
-
-- **`--dry-run`**: Runs baseline evaluation on all training tasks — scores the current SKILL.md WITH and WITHOUT the skill in context, shows per-task scores and a cost estimate, then exits without running optimization. Useful for checking your baseline before committing to a full run.
-
-- **`--apply`**: Runs optimization to completion, then immediately writes the optimized SKILL.md back to `databricks-skills/`. Combines `optimize` + `--apply-last` in one step. Use when you're confident in the preset and want a hands-off workflow.
-
-- **`--apply-last`**: Loads the previously saved `optimized_SKILL.md` and `last_optimization.json` from `.test/skills/<skill>/` and writes the optimized content back to the repo. Does **not** re-run optimization. Use after reviewing a previous run's diff to confirm the changes look good.
-
-- **`--include-tools`**: Makes MCP tool docstrings optimizable GEPA components alongside SKILL.md. Both are mutated by GEPA via round-robin selection. Tool descriptions are no longer read-only context — they become first-class candidates. Metric calls scale with component count (see [Component scaling](#component-scaling)).
-
-- **`--tools-only`**: Drops SKILL.md entirely. Only tool module docstrings become GEPA components. Uses a **cross-skill dataset** (tasks sampled from ALL skills with `ground_truth.yaml`, max 5 per skill) so optimized descriptions generalize across skills rather than overfitting to one.
-
-- **`--tool-modules`**: Filters which tool modules are extracted for optimization. Without this flag, all modules are included. Example: `--tool-modules sql serving` optimizes only the `tools_sql` and `tools_serving` components.
-
-- **`--all`**: Discovers all skills with `ground_truth.yaml` in `.test/skills/`, runs optimization sequentially for each, and prints per-skill results plus a summary table at the end.
-
-- **`--run-dir`**: Enables GEPA checkpointing. Each pass saves state to `{run_dir}/pass_{N}/`. If the same `--run-dir` is passed on a subsequent run, GEPA resumes from the last checkpoint. Use `touch {run_dir}/pass_N/gepa.stop` for graceful mid-pass stop.
-
-- **`--max-passes`**: Maximum number of optimization passes (default 5). Each pass feeds the previous best as seed. Early stops if improvement falls below the threshold (0.0005). Lower values trade potential quality for faster completion.
-
-- **`--token-budget`**: Hard ceiling on candidate token count. The efficiency scorer penalizes candidates that exceed this budget. Also available via `GEPA_TOKEN_BUDGET` env var.
-
-- **`--agent-eval`**: Hybrid agent evaluation mode. Runs a real Claude Code agent (via Claude Agent SDK) for baseline scoring before GEPA and validation after GEPA. GEPA iterations still use the fast proxy evaluator. Reports both proxy and agent scores side-by-side. Requires `claude-agent-sdk>=0.1.39` (`uv pip install -e ".test/[agent]"`).
-
-- **`--agent-eval-full`**: Full agent evaluation mode. Uses the real Claude Code agent for **all** GEPA iterations — every mutation is evaluated by running the agent. Most accurate but significantly slower. Use for final validation or when tool selection accuracy matters more than speed.
-
-- **`--agent-model`**: Override which model the Claude Code agent uses (e.g., `databricks-claude-sonnet-4-6`). Defaults to the `ANTHROPIC_MODEL` environment variable. The agent model is independent of `--gen-model` (which controls the proxy evaluator's generation model).
-
-- **`--agent-timeout`**: Maximum time in seconds for a single agent execution (default: 300). Increase for complex tasks that involve multiple tool calls. If an agent exceeds this timeout, the run is marked as failed with a partial trace.
-
-### Model Configuration
-
-| Env Var | Default | Purpose |
-|---------|---------|---------|
-| `GEPA_GEN_LM` | `databricks/databricks-claude-sonnet-4-6` | Generation model (proxy evaluator responses) |
-| `GEPA_REFLECTION_LM` | `databricks/databricks-claude-opus-4-6` | Reflection model (proposes mutations) |
-| `GEPA_JUDGE_LM` | `databricks/databricks-claude-sonnet-4-6` | Judge model (quality/effectiveness scoring) |
-| `GEPA_TOKEN_BUDGET` | none | Hard token ceiling for candidates |
-| `ANTHROPIC_BASE_URL` | none | Claude API base URL for agent evaluation |
-| `ANTHROPIC_API_KEY` | none | Claude API key for agent evaluation |
-| `ANTHROPIC_MODEL` | none | Default model for agent execution |
-
-Proxy evaluator models use [litellm provider prefixes](https://docs.litellm.ai/docs/providers): `databricks/`, `openai/`, `anthropic/`. Agent models use the model name directly (e.g., `databricks-claude-sonnet-4-6`) since they go through the Claude Agent SDK.
-
----
-
-## Resuming Long Runs
-
-GEPA saves optimization state to a run directory. If interrupted, resume from where you left off:
-
-```bash
-# Start with checkpointing
-uv run python .test/scripts/optimize.py databricks-metric-views \
-    --preset standard --run-dir ./opt_runs/metric-views
-
-# Resume after interruption (same command)
-uv run python .test/scripts/optimize.py databricks-metric-views \
-    --preset standard --run-dir ./opt_runs/metric-views
-
-# Graceful stop (GEPA finishes current iteration then exits)
-touch ./opt_runs/metric-views/pass_1/gepa.stop
-```
-
-Each pass gets its own subdirectory (`pass_1/`, `pass_2/`, ...) so checkpoints are isolated per pass.
-
----
-
-## Writing Test Cases
-
-Test cases in `ground_truth.yaml` define what each skill should teach. Minimal example:
-
-```yaml
-metadata:
-  skill_name: my-skill
-  version: "1.0"
-
-test_cases:
-  - id: basic_001
-    inputs:
-      prompt: "Show me how to create a streaming table"
-    outputs:
-      response: |
-        ```sql
-        CREATE OR REFRESH STREAMING TABLE bronze_events
-        AS SELECT * FROM STREAM read_files('s3://bucket/events/')
-        ```
-    expectations:
-      expected_facts:
-        - "Uses CREATE OR REFRESH STREAMING TABLE syntax"
-      expected_patterns:
-        - pattern: "CREATE OR REFRESH STREAMING TABLE"
-          description: "SDP DDL syntax"
-      guidelines:
-        - "Must use SDP syntax, not legacy DLT syntax"
+      trace_expectations:  # Only used with --agent-eval
+        required_tools:
+          - mcp__databricks__execute_sql
+        banned_tools:
+          - Bash
+        tool_limits:
+          mcp__databricks__execute_sql: 3
     metadata:
-      category: happy_path
+      category: happy_path  # Used for stratified train/val splitting
 ```
-
-**Tips:**
-- **5+ test cases** enables a train/val split for generalization
-- **Cover categories**: happy_path, error_handling, edge cases — the splitter stratifies by `metadata.category`
-- **`expected_patterns`** use regex — be specific (`"MEASURE\\("` not `".*MEASURE.*"`)
-- **`guidelines`** are evaluated by the MLflow quality judge — use for soft expectations that can't be regex-matched
-- **Generate from requirements**: `--requirement "Must explain MEASURE() wrapping"` auto-generates test cases
-
----
-
-## Test Case & Configuration Files
-
-Each skill under `.test/skills/<skill-name>/` has two configuration files that drive evaluation and optimization.
-
-### `ground_truth.yaml` — What the skill must teach
-
-The evaluation dataset. Each test case represents a user prompt and the expected behavior when the skill is in context.
-
-**Full field schema:**
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `metadata.skill_name` | yes | Identifier matching the skill directory name |
-| `metadata.version` | yes | Schema version (e.g., `"1.0"`) |
-| `metadata.created_at` | no | ISO timestamp of creation |
-| `test_cases[].id` | yes | Unique identifier (convention: `<skill>_<action>_<NNN>`) |
-| `test_cases[].inputs.prompt` | yes | The user question sent to the generation model |
-| `test_cases[].outputs.response` | no | Expected reference answer. Used for judge comparison, **not** exact matching. Omit if you only want pattern/fact checks. |
-| `test_cases[].expectations.expected_facts` | yes | List of factual claims the response must contain. The quality judge checks each one. |
-| `test_cases[].expectations.expected_patterns` | no | Regex patterns with fields: `pattern`, `description`, and optionally `min_count` / `max_count`. Checked deterministically. |
-| `test_cases[].expectations.guidelines` | no | Soft rules evaluated by the quality judge for things regex can't check (e.g., "Should explain why SELECT * doesn't work"). |
-| `test_cases[].expectations.trace_expectations` | no | Agent behavioral expectations (only used with `--agent-eval`). See [trace_expectations fields](#trace_expectations-fields) below. |
-| `test_cases[].metadata.category` | recommended | Used for stratified train/val splitting. Common values: `happy_path`, `error_handling`, `advanced`, `conceptual`, `edge_case`. |
+| `inputs.prompt` | Yes | The user question |
+| `expectations.expected_facts` | Yes | Facts the response must contain (checked by quality judge) |
+| `expectations.expected_patterns` | No | Regex patterns checked deterministically |
+| `expectations.guidelines` | No | Soft rules for the quality judge |
+| `expectations.trace_expectations` | No | Agent behavioral validation (only with `--agent-eval`) |
+| `outputs.response` | No | Reference answer for judge comparison |
+| `metadata.category` | Recommended | Stratified splitting (5+ test cases enables train/val split) |
 
-**Example with all fields:**
-
-```yaml
-metadata:
-  skill_name: databricks-metric-views
-  version: "1.0"
-  created_at: "2025-01-15T10:00:00Z"
-
-test_cases:
-  - id: metric-views_create_sql_001
-    inputs:
-      prompt: "Create a metric view for order analytics"
-    outputs:
-      response: |
-        ```sql
-        CREATE OR REPLACE VIEW main.default.order_metrics
-        WITH METRICS LANGUAGE YAML
-        $$
-        source: main.default.orders
-        measures:
-          - name: Total Revenue
-            expr: SUM(amount)
-        $$
-        ```
-    expectations:
-      expected_facts:
-        - "Uses CREATE OR REPLACE VIEW with WITH METRICS LANGUAGE YAML"
-        - "Defines measures with name and expr using aggregate functions"
-      expected_patterns:
-        - pattern: "WITH METRICS LANGUAGE YAML"
-          description: "Metric view DDL syntax"
-          min_count: 1
-        - pattern: "MEASURE\\("
-          description: "MEASURE() function for querying"
-          min_count: 0
-          max_count: 5
-      guidelines:
-        - "Must use WITH METRICS LANGUAGE YAML syntax, not CREATE METRIC VIEW"
-        - "Should include a complete YAML block between $$ delimiters"
-    metadata:
-      category: happy_path
-```
-
-#### `trace_expectations` fields
-
-These fields are nested under `expectations.trace_expectations` in each test case and are only evaluated when running with `--agent-eval` or `--agent-eval-full`. They validate the agent's actual tool behavior, not just response text.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `required_tools` | list of str | Tool names that the agent **must** call (e.g., `mcp__databricks__execute_sql`). Failing = score penalty. |
-| `banned_tools` | list of str | Tool names the agent **must not** call (e.g., `Bash` when `execute_sql` should be used). |
-| `tool_limits` | dict of str:int | Maximum number of calls per tool (e.g., `mcp__databricks__execute_sql: 3`). |
-| `tool_sequence` | list of str | Expected order of tool calls. Checks that tools appear and in relative order. |
-
-**Example:**
-
-```yaml
-trace_expectations:
-  required_tools:
-    - mcp__databricks__execute_sql
-  banned_tools:
-    - Bash
-  tool_limits:
-    mcp__databricks__execute_sql: 3
-  tool_sequence:
-    - Read
-    - mcp__databricks__execute_sql
-    - Write
-```
-
-### `manifest.yaml` — How to evaluate the skill
-
-Configures which scorers run and what quality thresholds apply during evaluation.
-
-**Full field schema:**
-
-| Field | Description |
-|-------|-------------|
-| `skill_name` | Identifier matching the skill directory name |
-| `scorers.enabled` | List of deterministic scorers to run: `python_syntax`, `sql_syntax`, `pattern_adherence`, `no_hallucinated_apis`, `expected_facts_present` |
-| `scorers.llm_scorers` | List of LLM-based scorers: `Safety`, `guidelines_from_expectations`, `Guidelines` |
-| `scorers.default_guidelines` | Fallback guidelines applied when a test case doesn't specify its own `guidelines` field |
-| `quality_gates` | Minimum score thresholds per scorer (e.g., `syntax_valid: 1.0`, `pattern_adherence: 0.9`). Failing a gate flags the test case. |
-| `scorers.trace_expectations.tool_limits` | Max number of tool calls allowed (for trace-based scoring) |
-| `scorers.trace_expectations.token_budget` | Max tokens allowed in the response |
-| `scorers.trace_expectations.required_tools` | Tools that must be called (e.g., `["execute_sql"]`) |
-| `scorers.trace_expectations.banned_tools` | Tools that must not be called |
-
-**Example:**
+### `manifest.yaml` — Scorer configuration
 
 ```yaml
 skill_name: databricks-metric-views
+tool_modules: [sql]  # Optional: MCP tool modules this skill uses
 
 scorers:
-  enabled:
-    - sql_syntax
-    - pattern_adherence
-    - expected_facts_present
-  llm_scorers:
-    - Safety
-    - guidelines_from_expectations
+  enabled: [sql_syntax, pattern_adherence, expected_facts_present]
+  llm_scorers: [Safety, guidelines_from_expectations]
   default_guidelines:
-    - "Responses must use Databricks-specific syntax, not generic SQL"
-    - "Code examples must be runnable without modification"
+    - "Responses must use Databricks-specific syntax"
 
 quality_gates:
   syntax_valid: 1.0
   pattern_adherence: 0.9
-  safety: 1.0
 ```
+
+The `tool_modules` field lists which MCP tool modules are relevant to the skill. When `--tools-only --tool-modules` is used, only skills whose `tool_modules` overlap with the requested modules are included in the cross-skill dataset. Behavior by value:
+
+- **`tool_modules: [sql, compute]`** — included when `--tool-modules` contains `sql` or `compute`
+- **`tool_modules: []`** — excluded from all `--tool-modules` filtered runs (no MCP tool dependency)
+- **Field omitted** — always included (backward compatible fallback)
+
+Without `--tool-modules`, all skills are included regardless. Available modules: `agent_bricks`, `aibi_dashboards`, `apps`, `compute`, `file`, `genie`, `jobs`, `lakebase`, `manifest`, `pipelines`, `serving`, `sql`, `unity_catalog`, `user`, `vector_search`, `volume_files`, `workspace`.
 
 ---
 
-## Architecture
+## Project Structure
 
 ```
 .test/
 ├── scripts/
-│   ├── optimize.py              # CLI entry point
-│   ├── generate_examples.py     # Generate test cases from requirements
-│   └── trace_to_examples.py     # Extract test cases from MLflow traces
-├── src/skill_test/agent/
-│   ├── __init__.py              # Exports AgentResult, run_agent
-│   └── executor.py              # Claude Agent SDK wrapper, event capture, TraceMetrics builder
-├── src/skill_test/optimize/
-│   ├── judges.py                # MLflow make_judge factories (quality, effectiveness, regression)
-│   ├── skillbench_evaluator.py  # WITH vs WITHOUT evaluator using judges (proxy mode)
-│   ├── agent_evaluator.py       # Agent-based evaluator using Claude Agent SDK
-│   ├── runner.py                # GEPA optimize_anything orchestrator (supports --agent-eval)
-│   ├── utils.py                 # Token counting, path resolution
-│   ├── asi.py                   # MLflow Feedback → side_info conversion
-│   ├── alignment.py             # MemAlign judge alignment (future)
-│   ├── config.py                # GEPA presets, model registration
-│   ├── splitter.py              # Train/val dataset splitting
-│   └── tools.py                 # MCP tool description extraction
-├── src/skill_test/scorers/
-│   ├── universal.py             # Deterministic: python_syntax, sql_syntax, etc.
-│   ├── trace.py                 # Trace-based: tool_count, token_budget, required/banned_tools, etc.
-│   └── routing.py               # Skill routing accuracy (deprecated)
+│   └── optimize.py              # CLI entry point
+├── claude_agent_settings.json   # Claude Code agent environment config
+├── src/skill_test/
+│   ├── agent/
+│   │   └── executor.py          # Claude Agent SDK wrapper + MLflow tracing
+│   └── optimize/
+│       ├── runner.py            # Multi-pass GEPA orchestrator
+│       ├── skillbench_evaluator.py  # Fast proxy evaluator (WITH vs WITHOUT)
+│       ├── agent_evaluator.py   # Real Claude Code agent evaluator
+│       ├── assessment_fetcher.py # MLflow assessment injection
+│       ├── judges.py            # MLflow judge factories + fallback chain
+│       ├── config.py            # Presets, model registration
+│       ├── splitter.py          # Train/val dataset splitting
+│       ├── tools.py             # MCP tool description extraction
+│       └── utils.py             # Token counting, path resolution
 └── skills/<skill-name>/
-    ├── ground_truth.yaml        # Test cases (now supports trace_expectations)
+    ├── ground_truth.yaml        # Test cases
     ├── manifest.yaml            # Scorer configuration
     ├── optimized_SKILL.md       # Last optimization output
     └── last_optimization.json   # Metadata for --apply-last
@@ -941,12 +342,23 @@ quality_gates:
 
 ## Troubleshooting
 
-### MLflow evaluation not returning results
-
-If `/skill-test <skill-name> mlflow` hangs or doesn't return results, run manually with debug logging:
-
+**MLflow evaluation hangs**: Run with debug logging:
 ```bash
 MLFLOW_LOG_LEVEL=DEBUG uv run python .test/scripts/mlflow_eval.py <skill-name>
 ```
 
-This will show detailed MLflow API calls and help identify connection or authentication issues.
+**Rate limits**: The framework automatically falls back through alternative models (GPT-5-2, Gemini-3-1-Pro, Claude Opus 4.5, etc.) with exponential backoff when rate-limited.
+
+**Agent eval fails**: Check that `.test/claude_agent_settings.json` has valid credentials and the model endpoint is accessible. The agent runs with a 300s default timeout — increase with `--agent-timeout`.
+
+**Resuming interrupted runs**: Use `--run-dir` for checkpointing:
+```bash
+# Start with checkpointing
+uv run python .test/scripts/optimize.py databricks-metric-views --preset standard --run-dir ./opt_runs/mv
+
+# Resume after interruption (same command)
+uv run python .test/scripts/optimize.py databricks-metric-views --preset standard --run-dir ./opt_runs/mv
+
+# Graceful stop mid-pass
+touch ./opt_runs/mv/pass_1/gepa.stop
+```

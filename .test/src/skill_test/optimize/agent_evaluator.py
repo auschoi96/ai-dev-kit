@@ -209,6 +209,7 @@ class AgentEvaluator:
         agent_model: str | None = None,
         agent_timeout: int = 300,
         mlflow_experiment: str | None = None,
+        skill_name: str | None = None,
     ):
         self._original_token_counts = original_token_counts or {}
         self._total_original_tokens = sum(self._original_token_counts.values())
@@ -218,6 +219,7 @@ class AgentEvaluator:
         self._agent_model = agent_model
         self._agent_timeout = agent_timeout
         self._mlflow_experiment = mlflow_experiment
+        self._skill_name = skill_name
 
         # Caches for WITHOUT-skill runs (keyed by prompt hash)
         self._baseline_response_cache: dict[str, str] = {}
@@ -240,6 +242,7 @@ class AgentEvaluator:
             timeout_seconds=self._agent_timeout,
             model=self._agent_model,
             mlflow_experiment=self._mlflow_experiment,
+            skill_name=self._skill_name,
         )
 
     def _get_baseline(self, prompt: str) -> tuple[str, dict, Any]:
@@ -498,6 +501,7 @@ def create_agent_evaluator(
         agent_model=agent_model,
         agent_timeout=agent_timeout,
         mlflow_experiment=mlflow_experiment,
+        skill_name=skill_name,
     )
 
 

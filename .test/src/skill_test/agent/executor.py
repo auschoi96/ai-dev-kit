@@ -267,7 +267,7 @@ def _get_agent_env() -> dict[str, str]:
     return env
 
 
-def _get_mlflow_stop_hook(mlflow_experiment: str | None = None):
+def _get_mlflow_stop_hook(mlflow_experiment: str | None = None, skill_name: str | None = None):
     """Create an MLflow Stop hook that processes the transcript into a real trace.
 
     Mirrors the pattern from databricks-builder-app/server/services/agent.py:
@@ -365,6 +365,8 @@ def _get_mlflow_stop_hook(mlflow_experiment: str | None = None):
                     if base_url:
                         client.set_trace_tag(trace_id, "databricks.model_serving_endpoint", base_url)
                     client.set_trace_tag(trace_id, "mlflow.source", "skill-test-agent-eval")
+                    if skill_name:
+                        client.set_trace_tag(trace_id, "skill_name", skill_name)
                 except Exception as tag_err:
                     print(f"    [MLflow] Warning: could not add tags: {tag_err}")
             else:
@@ -389,6 +391,7 @@ async def run_agent(
     timeout_seconds: int = 300,
     model: str | None = None,
     mlflow_experiment: str | None = None,
+    skill_name: str | None = None,
 ) -> AgentResult:
     """Run a Claude Code agent with optional skill injection.
 
@@ -442,7 +445,7 @@ async def run_agent(
         env["ANTHROPIC_MODEL"] = model
 
     # Set up MLflow tracing via Stop hook
-    mlflow_hook, mlflow_result = _get_mlflow_stop_hook(mlflow_experiment=mlflow_experiment)
+    mlflow_hook, mlflow_result = _get_mlflow_stop_hook(mlflow_experiment=mlflow_experiment, skill_name=skill_name)
     hooks = {}
     if mlflow_hook:
         hooks["Stop"] = [HookMatcher(hooks=[mlflow_hook])]
