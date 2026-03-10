@@ -7,12 +7,14 @@ provide both scores AND rich rationale for GEPA's reflection LM.
   Phase 1: WITH-SKILL  -- LLM generates response with SKILL.md in context
   Phase 2: WITHOUT-SKILL -- LLM generates response with NO skill (cached once)
   Phase 3: JUDGE -- quality_judge scores both, effectiveness derived from delta
+  Phase 4: ASSERTIONS -- deterministic fact/pattern checking (zero LLM cost)
 
 Scoring weights:
-  40% Skill Effectiveness (quality_with - quality_without delta)
+  35% Skill Effectiveness (quality_with - quality_without delta)
   30% Absolute Quality (quality_with score from judge)
+  15% Fact/Pattern Coverage (deterministic assertions from assertions.py)
    5% Structure (syntax validity)
-  25% Token Efficiency (smaller candidates score higher)
+  15% Token Efficiency (smaller candidates score higher)
 """
 
 from __future__ import annotations
@@ -27,10 +29,10 @@ from typing import Any, Callable
 from mlflow.entities import Feedback
 
 from ..scorers.universal import python_syntax, sql_syntax, no_hallucinated_apis
+from .assertions import run_all_assertions, summarize_failures
 from .judges import (
     JudgeFeedback,
     create_skill_quality_judge,
-    create_regression_judge,
     run_judge_safe,
     _safe_parse_score,
     completion_with_fallback,
@@ -167,7 +169,6 @@ class SkillBenchEvaluator:
         self._quality_judge = create_skill_quality_judge(
             skill_guidelines, judge_model=judge_model
         )
-        self._regression_judge = create_regression_judge(judge_model=judge_model)
 
     def _generate_response(self, prompt: str, skill_context: str | None = None) -> str:
         """Generate a response with or without skill context."""
@@ -310,6 +311,18 @@ class SkillBenchEvaluator:
         else:
             effectiveness_verdict = 0.5  # same
 
+        # Phase 4: Deterministic fact/pattern assertions (zero LLM cost)
+        with_results = run_all_assertions(with_response, expectations)
+        without_results = run_all_assertions(without_response, expectations)
+
+        fact_results = [r for r in with_results if r.assertion_type == "fact"]
+        pattern_results = [r for r in with_results if r.assertion_type == "pattern"]
+        fact_score = sum(1 for r in fact_results if r.passed) / len(fact_results) if fact_results else 1.0
+        pattern_score = sum(1 for r in pattern_results if r.passed) / len(pattern_results) if pattern_results else 1.0
+
+        # GEPA-friendly diagnostics from assertion comparison
+        failure_summary = summarize_failures(with_results, without_results)
+
         # Structure validation on the skill itself
         structure = _run_structure_scorers(skill_md) if skill_md else 1.0
 
@@ -329,13 +342,15 @@ class SkillBenchEvaluator:
         else:
             efficiency = 1.0
 
-        # Weighted final score
-        final_score = (
-            0.40 * max(0.0, effectiveness_delta)
+        # Weighted final score — negative deltas penalize; clamp composite to [0, 1]
+        fact_pattern = 0.5 * fact_score + 0.5 * pattern_score
+        final_score = max(0.0, min(1.0,
+            0.35 * effectiveness_delta
             + 0.30 * score_with
+            + 0.15 * fact_pattern
             + 0.05 * structure
-            + 0.25 * efficiency
-        )
+            + 0.15 * efficiency
+        ))
 
         # Build side info with FULL judge rationale (not truncated!)
         reference_answer = example.get("answer", "")
@@ -344,7 +359,7 @@ class SkillBenchEvaluator:
 
         # Task context
         if prompt:
-            side_info["Task"] = prompt[:200]
+            side_info["Task"] = prompt[:500]
 
         # Full judge feedback — the critical fix for GEPA optimization
         side_info["Judge_quality_with"] = {
@@ -365,19 +380,33 @@ class SkillBenchEvaluator:
             ),
             "delta": effectiveness_delta,
         }
+        # Assertion-based structured feedback — GEPA renders each key as a markdown header
+        side_info["Missing_Facts"] = [r.rationale for r in fact_results if not r.passed]
+        side_info["Missing_Patterns"] = [r.rationale for r in pattern_results if not r.passed]
+        side_info["Passed_Facts"] = [r.rationale for r in fact_results if r.passed]
+        side_info["Passed_Patterns"] = [r.rationale for r in pattern_results if r.passed]
+
+        # skill_md_specific_info — shown ONLY when reflecting on the skill component
+        if failure_summary.get("Error") or failure_summary.get("Regressions"):
+            side_info["skill_md_specific_info"] = {
+                "Assertion_Diagnostics": failure_summary.get("Error", ""),
+                "Regressions": failure_summary.get("Regressions", ""),
+            }
 
         # Expected vs Actual for GEPA reflection
         if reference_answer:
-            side_info["Expected"] = reference_answer[:500]
+            side_info["Expected"] = reference_answer[:2000]
         if with_response:
-            side_info["Actual"] = with_response[:500]
+            side_info["Actual"] = with_response[:2000]
 
-        # Score breakdown
+        # Score breakdown (scores dict feeds GEPA's Pareto frontier)
         side_info["scores"] = {
             "quality_with": score_with,
             "quality_without": score_without,
             "skill_effectiveness": effectiveness_delta,
             "effectiveness_verdict": effectiveness_verdict,
+            "fact_coverage": fact_score,
+            "pattern_adherence": pattern_score,
             "structure": structure,
             "token_efficiency": efficiency,
             "final": final_score,
@@ -403,15 +432,15 @@ class SkillBenchEvaluator:
                     for a in matched
                 ]
 
-        # Derive diagnostic labels from judge verdicts for backward compat
-        if effectiveness_delta < -0.05:
+        # Derive diagnostic labels from assertions + judge verdicts
+        if failure_summary.get("Error"):
+            # Assertions detected specific NEEDS_SKILL/REGRESSION items
+            side_info["Error"] = failure_summary["Error"]
+        elif effectiveness_delta < -0.05:
             side_info["Error"] = (
                 f"REGRESSION: skill_effectiveness delta={effectiveness_delta:.2f} "
                 f"(with={score_with:.2f}, without={score_without:.2f})"
             )
-            side_info["skill_md_specific_info"] = {
-                "Regressions": quality_with_fb.rationale,
-            }
         elif score_with < 0.5:
             side_info["Error"] = (
                 f"NEEDS_SKILL: quality_with={score_with:.2f}, missing content. Judge: {quality_with_fb.rationale[:200]}"
@@ -557,7 +586,7 @@ def build_skillbench_background(
         )
 
     token_desc = (
-        f"\nTOKEN EFFICIENCY (25% of score): Current artifacts total {original_token_count:,} tokens. "
+        f"\nTOKEN EFFICIENCY (15% of score): Current artifacts total {original_token_count:,} tokens. "
         "Smaller candidates score HIGHER. Be ruthlessly concise."
     )
     if token_budget:
@@ -580,8 +609,10 @@ def build_skillbench_background(
         f"You are refining SKILL.md for '{skill_name}'.\n"
         "The skill is scored by MLflow judges that evaluate how much it HELPS an agent.\n"
         "Judge rationale in side_info explains exactly WHAT failed and WHY.\n"
-        "Use Judge_quality_with to see missing facts/patterns.\n"
+        "Use Judge_quality_with for nuanced quality feedback.\n"
         "Use Judge_effectiveness to see if the skill helped or hurt.\n"
+        "Missing_Facts and Missing_Patterns show exact pass/fail for each expected assertion.\n"
+        "Passed_Facts and Passed_Patterns show what the skill already covers.\n"
         "Focus on: specific API syntax, version requirements, non-obvious patterns.\n"
         "Do NOT add generic knowledge the agent already has."
         f"{baseline_desc}"

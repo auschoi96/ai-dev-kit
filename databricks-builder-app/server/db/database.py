@@ -45,6 +45,12 @@ _lakebase_instance_name: Optional[str] = None
 # Token refresh interval (50 minutes - tokens expire after 1 hour)
 TOKEN_REFRESH_INTERVAL_SECONDS = 50 * 60
 
+# Materialized view refresh state
+_matview_refresh_task: Optional[asyncio.Task] = None
+
+# Materialized view refresh interval (1 hour)
+MATVIEW_REFRESH_INTERVAL_SECONDS = 60 * 60
+
 # Cached resolved hostaddr for DNS workaround
 _resolved_hostaddr: Optional[str] = None
 
@@ -511,6 +517,90 @@ async def test_database_connection() -> Optional[str]:
         return None
     except Exception as e:
         return str(e)
+
+
+async def _refresh_materialized_view(view_name: str = "daily_revenue_by_region") -> bool:
+    """Refresh a materialized view using CONCURRENTLY (non-blocking).
+
+    Uses CONCURRENTLY so the view remains readable during refresh.
+    Requires a UNIQUE index on the materialized view.
+
+    Args:
+        view_name: Name of the materialized view to refresh
+
+    Returns:
+        True if refresh succeeded, False otherwise
+    """
+    if _engine is None:
+        logger.warning("Cannot refresh materialized view: database engine not initialized")
+        return False
+
+    try:
+        from sqlalchemy import text
+
+        async with _engine.begin() as conn:
+            await conn.execute(
+                text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}")
+            )
+        logger.info(f"Materialized view '{view_name}' refreshed successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to refresh materialized view '{view_name}': {e}")
+        return False
+
+
+async def _matview_refresh_loop():
+    """Background task to refresh materialized views every hour.
+
+    Runs an initial refresh on startup (after a short delay to allow
+    migrations to complete), then refreshes every MATVIEW_REFRESH_INTERVAL_SECONDS.
+    """
+    # Wait 30 seconds on startup to allow migrations to complete
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            await _refresh_materialized_view("daily_revenue_by_region")
+        except asyncio.CancelledError:
+            logger.info("Materialized view refresh task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in materialized view refresh loop: {e}")
+
+        try:
+            await asyncio.sleep(MATVIEW_REFRESH_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("Materialized view refresh task cancelled")
+            break
+
+
+async def start_matview_refresh():
+    """Start the background materialized view refresh task."""
+    global _matview_refresh_task
+
+    if _matview_refresh_task is not None:
+        logger.warning("Materialized view refresh task already running")
+        return
+
+    _matview_refresh_task = asyncio.create_task(_matview_refresh_loop())
+    logger.info(
+        f"Started materialized view refresh background task "
+        f"(interval: {MATVIEW_REFRESH_INTERVAL_SECONDS}s)"
+    )
+
+
+async def stop_matview_refresh():
+    """Stop the background materialized view refresh task."""
+    global _matview_refresh_task
+
+    if _matview_refresh_task is not None:
+        _matview_refresh_task.cancel()
+        try:
+            await _matview_refresh_task
+        except asyncio.CancelledError:
+            pass
+        _matview_refresh_task = None
+        logger.info("Stopped materialized view refresh background task")
 
 
 def run_migrations() -> None:

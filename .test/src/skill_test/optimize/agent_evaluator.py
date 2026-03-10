@@ -31,6 +31,7 @@ from ..scorers.trace import (
     tool_count as tool_count_scorer,
     tool_sequence as tool_sequence_scorer,
 )
+from .assertions import run_all_assertions, summarize_failures
 from .judges import (
     JudgeFeedback,
     create_skill_quality_judge,
@@ -342,6 +343,17 @@ class AgentEvaluator:
         score_without = _safe_parse_score(quality_without_fb.value)
         effectiveness_delta = score_with - score_without
 
+        # Deterministic fact/pattern assertions (zero LLM cost)
+        with_assertion_results = run_all_assertions(with_response, expectations)
+        without_assertion_results = run_all_assertions(without_response, expectations)
+
+        fact_results = [r for r in with_assertion_results if r.assertion_type == "fact"]
+        pattern_results = [r for r in with_assertion_results if r.assertion_type == "pattern"]
+        fact_score = sum(1 for r in fact_results if r.passed) / len(fact_results) if fact_results else 1.0
+        pattern_score = sum(1 for r in pattern_results if r.passed) / len(pattern_results) if pattern_results else 1.0
+
+        failure_summary = summarize_failures(with_assertion_results, without_assertion_results)
+
         # Phase 4: Tool-call judges (MLflow or fallback)
         tool_scores = _run_mlflow_tool_judges(
             with_trace,
@@ -389,7 +401,7 @@ class AgentEvaluator:
         side_info: dict[str, Any] = {}
 
         if prompt:
-            side_info["Task"] = prompt[:200]
+            side_info["Task"] = prompt[:500]
 
         side_info["Judge_quality_with"] = {
             "score": score_with,
@@ -405,6 +417,18 @@ class AgentEvaluator:
             ),
             "delta": effectiveness_delta,
         }
+
+        # Assertion-based structured feedback
+        side_info["Missing_Facts"] = [r.rationale for r in fact_results if not r.passed]
+        side_info["Missing_Patterns"] = [r.rationale for r in pattern_results if not r.passed]
+        side_info["Passed_Facts"] = [r.rationale for r in fact_results if r.passed]
+        side_info["Passed_Patterns"] = [r.rationale for r in pattern_results if r.passed]
+
+        if failure_summary.get("Error") or failure_summary.get("Regressions"):
+            side_info["skill_md_specific_info"] = {
+                "Assertion_Diagnostics": failure_summary.get("Error", ""),
+                "Regressions": failure_summary.get("Regressions", ""),
+            }
 
         # Agent-specific details
         side_info["agent_trace"] = {
@@ -424,15 +448,17 @@ class AgentEvaluator:
         # Expected vs Actual
         reference_answer = example.get("answer", "")
         if reference_answer:
-            side_info["Expected"] = reference_answer[:500]
+            side_info["Expected"] = reference_answer[:2000]
         if with_response:
-            side_info["Actual"] = with_response[:500]
+            side_info["Actual"] = with_response[:2000]
 
-        # Score breakdown
+        # Score breakdown (scores dict feeds GEPA's Pareto frontier)
         side_info["scores"] = {
             "quality_with": score_with,
             "quality_without": score_without,
             "skill_effectiveness": effectiveness_delta,
+            "fact_coverage": fact_score,
+            "pattern_adherence": pattern_score,
             "tool_correctness": tool_correctness,
             "tool_efficiency": tool_efficiency,
             "behavioral": behavioral_score,

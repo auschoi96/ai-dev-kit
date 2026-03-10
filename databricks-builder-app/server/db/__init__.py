@@ -11,17 +11,20 @@ from .database import (
   is_postgres_configured,
   run_migrations,
   session_scope,
+  start_matview_refresh,
   start_token_refresh,
+  stop_matview_refresh,
   stop_token_refresh,
   test_database_connection,
 )
-from .models import Base, Conversation, Execution, Message, Project
+from .models import Base, Conversation, Execution, Message, Order, Project
 
 __all__ = [
   'Base',
   'Conversation',
   'Execution',
   'Message',
+  'Order',
   'Project',
   'create_tables',
   'get_engine',
@@ -33,7 +36,9 @@ __all__ = [
   'is_postgres_configured',
   'run_migrations',
   'session_scope',
+  'start_matview_refresh',
   'start_token_refresh',
+  'stop_matview_refresh',
   'stop_token_refresh',
   'test_database_connection',
 ]
