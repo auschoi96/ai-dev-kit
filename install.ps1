@@ -199,8 +199,10 @@ function Write-Err  {
     param([string]$Text)
     Write-Host "  " -NoNewline; Write-Host "x" -ForegroundColor Red -NoNewline; Write-Host " $Text"
     Write-Host ""
-    Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
-    try { $null = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } catch {}
+    if (Test-Interactive) {
+        Write-Host "  Press any key to exit..." -ForegroundColor DarkGray
+        try { $null = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } catch {}
+    }
     exit 1
 }
 function Write-Step { param([string]$Text) if (-not $script:Silent) { Write-Host ""; Write-Host "$Text" -ForegroundColor White } }
@@ -265,6 +267,8 @@ while ($i -lt $args.Count) {
 function Test-Interactive {
     if ($script:Silent) { return $false }
     try {
+        # Detect piped execution (e.g., irm ... | iex) where stdin is consumed by the pipe
+        if ([Console]::IsInputRedirected) { return $false }
         $host.UI.RawUI.KeyAvailable | Out-Null
         return $true
     } catch {
