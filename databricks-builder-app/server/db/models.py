@@ -1,11 +1,10 @@
-"""Database models for Projects, Conversations, Messages, and Orders."""
+"""Database models for Projects, Conversations, and Messages."""
 
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Any, List, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, Numeric, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -217,42 +216,4 @@ class Execution(Base):
       'error': self.error,
       'created_at': self.created_at.isoformat() if self.created_at else None,
       'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-    }
-
-
-class Order(Base):
-  """Order model - represents a customer order with revenue data.
-
-  Used as the source table for the daily_revenue_by_region materialized view.
-  """
-
-  __tablename__ = 'orders'
-
-  id: Mapped[str] = mapped_column(String(50), primary_key=True, default=generate_uuid)
-  region: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-  amount: Mapped[Decimal] = mapped_column(Numeric(precision=12, scale=2), nullable=False)
-  currency: Mapped[str] = mapped_column(String(3), nullable=False, default='USD')
-  status: Mapped[str] = mapped_column(
-    String(20), nullable=False, default='completed'
-  )  # completed, pending, cancelled, refunded
-  customer_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-  created_at: Mapped[datetime] = mapped_column(
-    DateTime(timezone=True), default=utc_now, nullable=False
-  )
-
-  __table_args__ = (
-    Index('ix_orders_region_created_at', 'region', 'created_at'),
-    Index('ix_orders_status', 'status'),
-  )
-
-  def to_dict(self) -> dict[str, Any]:
-    """Convert to dictionary."""
-    return {
-      'id': self.id,
-      'region': self.region,
-      'amount': float(self.amount) if self.amount else 0.0,
-      'currency': self.currency,
-      'status': self.status,
-      'customer_id': self.customer_id,
-      'created_at': self.created_at.isoformat() if self.created_at else None,
     }

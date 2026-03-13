@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 
-from .db import is_postgres_configured, is_dynamic_token_mode, run_migrations, init_database, start_token_refresh, stop_token_refresh, start_matview_refresh, stop_matview_refresh
+from .db import is_postgres_configured, is_dynamic_token_mode, run_migrations, init_database, start_token_refresh, stop_token_refresh
 from .routers import agent_router, clusters_router, config_router, conversations_router, projects_router, skills_router, warehouses_router
 from .services.backup_manager import start_backup_worker, stop_backup_worker
 from .services.skills_manager import copy_skills_to_app
@@ -62,9 +62,6 @@ async def lifespan(app: FastAPI):
       # Run migrations in background thread (non-blocking)
       asyncio.create_task(asyncio.to_thread(run_migrations))
 
-      # Start hourly materialized view refresh (daily_revenue_by_region)
-      await start_matview_refresh()
-
       # Start backup worker
       start_backup_worker()
     except Exception as e:
@@ -83,8 +80,7 @@ async def lifespan(app: FastAPI):
 
   logger.info('Shutting down application...')
 
-  # Stop background tasks
-  await stop_matview_refresh()
+  # Stop token refresh if running
   await stop_token_refresh()
 
   stop_backup_worker()
