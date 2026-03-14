@@ -15,6 +15,7 @@ For setup instructions and CLI usage, see [README.md](README.md).
 - [GEPA Optimization Loop](#gepa-optimization-loop)
 - [Multi-Pass Optimization](#multi-pass-optimization)
 - [Judges & Assertions](#judges--assertions)
+- [Adaptive Evaluation Criteria](#adaptive-evaluation-criteria)
 - [MLflow Assessment Injection](#mlflow-assessment-injection)
 - [MLflow Tracing Integration](#mlflow-tracing-integration)
 - [Component Scaling](#component-scaling)
@@ -378,6 +379,87 @@ Effectiveness is derived per-dimension: `correctness_delta = correctness_with - 
 
 ---
 
+## Adaptive Evaluation Criteria
+
+Judges can adaptively load domain-specific rubrics during scoring. Evaluation criteria are packaged as SKILL.md files in `.test/eval-criteria/` — the same format used by agent skills. This implements the `Skill`/`SkillSet` data model from the [MLflow #21255 design spec](https://github.com/mlflow/mlflow/issues/21255#issuecomment-3997922398).
+
+### Discovery and parsing (`eval_criteria.py`)
+
+`discover_eval_criteria()` scans `.test/eval-criteria/` for subdirectories containing a `SKILL.md` file. Each is parsed into an `EvalCriteriaSkill` dataclass:
+
+```python
+@dataclass
+class EvalCriteriaSkill:
+    name: str                    # From frontmatter (e.g., "sql-correctness")
+    description: str             # One-line description for judge prompt
+    path: Path                   # Directory path
+    metadata: dict[str, Any]     # Full YAML frontmatter metadata
+    body: str                    # Markdown body (the actual rubric)
+    references: dict[str, str]   # {relative_path: content} from references/
+    applies_to: list[str]        # tool_modules filter (from metadata.applies_to)
+```
+
+`EvalCriteriaSet` holds all parsed criteria and provides:
+- **`filter_by_modules(tool_modules)`** — returns subset matching the skill's `tool_modules`. Criteria with empty `applies_to` are always included (general-purpose).
+- **`to_prompt(model)`** — generates a lightweight listing for system-prompt injection. Uses XML format for Claude models, Markdown for others. Only includes name + description (~50-100 tokens per criteria), not the full body.
+- **`get_skill(name)`** — lookup by name for tool invocation.
+
+### Tool registration (`judge_tools.py`)
+
+Two tools are registered in MLflow's global `JudgeToolRegistry` via `register_eval_tools()`:
+
+| Tool | Arguments | Returns |
+|------|-----------|---------|
+| `read_eval_criteria` | `skill_name` | Full rubric body (markdown) |
+| `read_eval_reference` | `skill_name`, `file_path` | Reference document content |
+
+These implement `ReadSkillTool` and `ReadSkillReferenceTool` from the MLflow #21255 spec. Both accept a `trace: Trace` parameter (required by the `JudgeTool` interface) but route lookups through the internal `EvalCriteriaSet`. Registration is idempotent — safe to call multiple times per process.
+
+`ReadEvalReferenceTool` includes path traversal protection: normalized paths starting with `..` or absolute paths are rejected.
+
+### System prompt injection
+
+When judges are created, the `EvalCriteriaSet` is passed to each judge factory function (`make_correctness_judge`, `make_completeness_judge`, `make_guideline_adherence_judge`). The criteria listing is injected into the judge's system prompt via `to_prompt()`:
+
+**Claude models (XML):**
+```xml
+<available_skills>
+  <skill>
+    <name>sql-correctness</name>
+    <description>SQL evaluation criteria for Databricks...</description>
+  </skill>
+  ...
+</available_skills>
+```
+
+**Other models (Markdown):**
+```markdown
+## Available Evaluation Criteria
+
+- **sql-correctness**: SQL evaluation criteria for Databricks...
+```
+
+The judge sees the listing and decides whether to call `read_eval_criteria` based on the trace content. This keeps the system prompt small while giving judges access to deep domain rubrics on demand.
+
+### `applies_to` filtering
+
+Criteria are filtered by `tool_modules` from the skill's `manifest.yaml`:
+
+- **`applies_to: [sql]`** — only available when evaluating skills with `tool_modules` containing `sql`
+- **`applies_to: []`** (or omitted) — always available (e.g., `general-quality`, `tool-selection`)
+
+Filtering happens at evaluator initialization: `discover_eval_criteria()` loads all criteria, then `filter_by_modules()` narrows the set before tool registration and judge creation.
+
+### Future: MLflow native `make_judge(skills=[...])`
+
+This module is a bridge implementation. When MLflow ships the native `make_judge(skills=[...])` API from the #21255 spec, replace:
+- `eval_criteria.py` → `from mlflow.genai.skills import SkillSet`
+- `judge_tools.py` → MLflow's built-in skill tools (auto-registered via type annotation)
+
+The SKILL.md files and `references/` directories remain unchanged — only the loading/registration code changes.
+
+---
+
 ## MLflow Assessment Injection
 
 The `--mlflow-assessments EXPERIMENT_ID` flag fetches real-world behavioral feedback from MLflow traces and injects it into GEPA's optimization context.
@@ -575,10 +657,20 @@ Optimizing both simultaneously creates a **confounding variable problem**:
                  guideline_adherence_judge,     TraceMetrics builder)
                  regression_judge,
                  model fallback)
-                          │                               │
-                          ▼                               ▼
+                     │
+                     ├─── eval_criteria.py
+                     │    (discover + parse SKILL.md
+                     │     rubrics from eval-criteria/)
+                     │
+                     └─── judge_tools.py
+                          (register read_eval_criteria +
+                           read_eval_reference as
+                           MLflow JudgeTools)
+                          │
+                          ▼
                   MLflow make_judge              MLflow Tracing
-                  (scoring + rationale)          (process_transcript)
+                  (scoring + rationale +         (process_transcript)
+                   adaptive criteria tools)
                                                           │
                                                           ▼
                                                 assessment_fetcher.py

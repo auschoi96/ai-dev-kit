@@ -311,6 +311,63 @@ Without `--tool-modules`, all skills are included regardless. Available modules:
 
 ---
 
+## Evaluation Criteria
+
+Evaluation criteria are domain-specific rubrics that judges can load on demand when scoring traces. They live in `.test/eval-criteria/` as SKILL.md files — the same format used by agent skills.
+
+### Directory structure
+
+Each criteria is a folder containing a `SKILL.md` (YAML frontmatter + markdown body) and an optional `references/` directory with detailed rubrics:
+
+```
+eval-criteria/
+├── general-quality/          # Always loaded (applies_to: [])
+│   └── SKILL.md
+├── sql-correctness/          # Loaded for SQL-related skills (applies_to: [sql])
+│   ├── SKILL.md
+│   └── references/
+│       └── DATABRICKS_SQL_PATTERNS.md
+└── tool-selection/           # Always loaded (applies_to: [])
+    ├── SKILL.md
+    └── references/
+        └── MCP_TOOL_GUIDE.md
+```
+
+### How it works
+
+Judges receive a lightweight listing of available criteria in their system prompt. When a criteria's description matches the trace being evaluated, the judge calls `read_eval_criteria` to load the full rubric and `read_eval_reference` for detailed reference material. This keeps judge prompts small while giving access to deep domain knowledge.
+
+### `applies_to` filtering
+
+The `applies_to` metadata field controls which criteria are available based on the skill's `tool_modules`:
+
+- **`applies_to: [sql]`** — loaded only when the skill declares `tool_modules: [sql]`
+- **`applies_to: []`** (or omitted) — always loaded (general-purpose criteria)
+
+### Adding a new criteria
+
+1. Create a folder: `.test/eval-criteria/<criteria-name>/`
+2. Add `SKILL.md` with YAML frontmatter:
+   ```yaml
+   ---
+   name: my-criteria
+   description: >
+     One-line description of when this criteria applies.
+   metadata:
+     category: evaluation
+     version: "1.0"
+     applies_to: [sql, compute]  # Empty list = always loaded
+   ---
+
+   ## Rubric content here...
+   ```
+3. Optionally add `references/` with detailed `.md` files
+4. The criteria will be auto-discovered on the next evaluation run
+
+For technical details on how criteria are loaded and injected, see [TECHNICAL.md — Adaptive Evaluation Criteria](TECHNICAL.md#adaptive-evaluation-criteria).
+
+---
+
 ## Evaluation & Scoring
 
 ### SkillBench evaluator (default)
@@ -389,6 +446,17 @@ The agent evaluator also uses `assertions.py` for structured `Missing_Facts`/`Mi
 
 ```
 .test/
+├── eval-criteria/                  # Domain-specific judge rubrics
+│   ├── general-quality/
+│   │   └── SKILL.md
+│   ├── sql-correctness/
+│   │   ├── SKILL.md
+│   │   └── references/
+│   │       └── DATABRICKS_SQL_PATTERNS.md
+│   └── tool-selection/
+│       ├── SKILL.md
+│       └── references/
+│           └── MCP_TOOL_GUIDE.md
 ├── scripts/
 │   └── optimize.py              # CLI entry point
 ├── claude_agent_settings.json   # Claude Code agent environment config
@@ -402,6 +470,8 @@ The agent evaluator also uses `assertions.py` for structured `Missing_Facts`/`Mi
 │       ├── assertions.py        # Deterministic fact/pattern assertions (zero LLM cost)
 │       ├── assessment_fetcher.py # MLflow assessment injection
 │       ├── judges.py            # MLflow quality judge factory + fallback chain
+│       ├── eval_criteria.py     # Eval criteria discovery + SKILL.md parser
+│       ├── judge_tools.py       # MLflow JudgeTool registration for criteria
 │       ├── config.py            # Presets, model registration
 │       ├── splitter.py          # Train/val dataset splitting
 │       ├── tools.py             # MCP tool description extraction
