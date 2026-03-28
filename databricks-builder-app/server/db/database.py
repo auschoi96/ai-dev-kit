@@ -332,6 +332,9 @@ def init_database(database_url: Optional[str] = None) -> AsyncEngine:
         # Static URL mode - use as-is
         logger.info("Using static LAKEBASE_PG_URL for database connection")
         url, connect_args = _prepare_async_url(url)
+        # Ensure search_path includes the app schema so unqualified table names resolve
+        schema_name = os.environ.get('LAKEBASE_SCHEMA_NAME', 'builder_app')
+        connect_args.setdefault('options', f'-c search_path={schema_name},public')
     else:
         # Dynamic token mode - build URL from components
         endpoint_name = os.environ.get("LAKEBASE_ENDPOINT")
@@ -580,14 +583,12 @@ async def test_database_connection() -> Optional[str]:
 
         return None
     except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
         return str(e)
 
 
 def run_migrations() -> None:
-    """Run Alembic migrations programmatically.
-
-    Safe to run multiple times - Alembic tracks applied migrations.
-    """
+    """Run Alembic migrations programmatically."""
     if not is_postgres_configured():
         return
 
@@ -596,20 +597,17 @@ def run_migrations() -> None:
 
     from alembic import command
     from alembic.config import Config
+    from alembic.util.exc import CommandError
 
     logger = logging.getLogger(__name__)
     logger.info("Running database migrations...")
 
     try:
-        # Find the app root directory (where alembic.ini lives)
-        # This file is at server/db/database.py, so app root is 2 levels up
         app_root = Path(__file__).parent.parent.parent
-
-        # Check multiple possible locations for alembic.ini
         possible_paths = [
-            app_root / "alembic.ini",  # Standard location
-            Path("/app/python/source_code") / "alembic.ini",  # Databricks Apps
-            Path(".") / "alembic.ini",  # Current directory fallback
+            app_root / "alembic.ini",
+            Path("/app/python/source_code") / "alembic.ini",
+            Path(".") / "alembic.ini",
         ]
 
         alembic_ini_path = None
@@ -620,26 +618,46 @@ def run_migrations() -> None:
 
         if not alembic_ini_path:
             logger.warning(
-                f"alembic.ini not found in any of: {[str(p) for p in possible_paths]}. "
-                "Skipping migrations."
+                f"alembic.ini not found in: {[str(p) for p in possible_paths]}. Skipping."
             )
             return
 
         logger.info(f"Using alembic config from: {alembic_ini_path}")
-
         alembic_cfg = Config(str(alembic_ini_path))
 
-        # Set script_location to absolute path to avoid working directory issues
         alembic_dir = alembic_ini_path.parent / "alembic"
         if alembic_dir.exists():
             alembic_cfg.set_main_option("script_location", str(alembic_dir))
 
-        # Pass the schema name to Alembic env.py via config
         schema_name = os.environ.get("LAKEBASE_SCHEMA_NAME", "builder_app")
         alembic_cfg.set_main_option("lakebase_schema_name", schema_name)
 
-        command.upgrade(alembic_cfg, "head")
+        # Save root logger config (fileConfig in env.py reconfigures it)
+        root_logger = logging.getLogger()
+        saved_handlers = root_logger.handlers[:]
+        saved_level = root_logger.level
+
+        try:
+            command.upgrade(alembic_cfg, "head")
+        except CommandError as e:
+            if "Can't locate revision" in str(e):
+                logger.warning(f"Stale migration history from previous deployment: {e}")
+                logger.warning("Stamping to current head and continuing.")
+                command.stamp(alembic_cfg, "head", purge=True)
+            else:
+                raise
+
+        # Restore root logger config
+        root_logger.handlers = saved_handlers
+        root_logger.setLevel(saved_level)
+
         logger.info("Database migrations completed")
     except Exception as e:
+        try:
+            root_logger = logging.getLogger()
+            root_logger.handlers = saved_handlers
+            root_logger.setLevel(saved_level)
+        except NameError:
+            pass
         logger.error(f"Migration failed: {e}")
         raise

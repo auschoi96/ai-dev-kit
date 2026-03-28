@@ -23,7 +23,7 @@ config = context.config
 
 # Setup logging from alembic.ini
 if config.config_file_name is not None:
-  fileConfig(config.config_file_name)
+  fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Target metadata for autogenerate
 target_metadata = Base.metadata
@@ -152,14 +152,54 @@ def run_migrations_online():
   )
 
   with connectable.connect() as connection:
-    # Create the schema if it doesn't exist (SP has CREATE on the database)
     from sqlalchemy import text
-    connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS {schema_name}'))
-    connection.commit()
+    import logging
+    logger = logging.getLogger('alembic.env')
+
+    # Attempt to create the schema (succeeds if new, no-op if exists)
+    try:
+      connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS {schema_name}'))
+      connection.commit()
+    except Exception as e:
+      logger.warning(f'Could not create schema {schema_name!r}: {e}')
+      connection.rollback()
+
+    # Check if we have USAGE privilege on the schema.
+    # Catches the case where the schema was created by a different principal
+    # and the current user (e.g. Databricks App SP) lacks access.
+    effective_schema = schema_name
+    if schema_name != 'public':
+      try:
+        result = connection.execute(
+          text("SELECT has_schema_privilege(current_user, :schema, 'USAGE')"),
+          {'schema': schema_name},
+        )
+        has_usage = result.scalar()
+      except Exception as e:
+        logger.warning(f'Could not check privileges on {schema_name!r}: {e}')
+        has_usage = False
+
+      if not has_usage:
+        try:
+          current_user = connection.execute(text('SELECT current_user')).scalar()
+        except Exception:
+          current_user = '<service-principal>'
+
+        logger.warning(
+          f'Schema {schema_name!r} exists but current user "{current_user}" '
+          f'lacks USAGE privilege. Falling back to "public" schema. '
+          f'To fix, run as schema owner: '
+          f'GRANT USAGE, CREATE ON SCHEMA {schema_name} TO "{current_user}"; '
+          f'GRANT ALL ON ALL TABLES IN SCHEMA {schema_name} TO "{current_user}";'
+        )
+        effective_schema = 'public'
+        connection.execute(text('SET search_path TO public'))
+        connection.commit()
 
     context.configure(
       connection=connection,
       target_metadata=target_metadata,
+      version_table_schema=effective_schema,
     )
 
     with context.begin_transaction():

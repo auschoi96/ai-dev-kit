@@ -220,6 +220,12 @@ def main():
         default=None,
         help="File with focus areas (one per line). Combined with --focus args.",
     )
+    parser.add_argument(
+        "--focus-model",
+        type=str,
+        default="databricks/databricks-claude-sonnet-4-6",
+        help="LLM model for focus pre-processing (default: databricks/databricks-claude-sonnet-4-6).",
+    )
 
     args = parser.parse_args()
 
@@ -294,9 +300,7 @@ def main():
     # Apply focus areas before optimization
     if focus_areas:
         from focus import apply_focus
-        from skill_test.optimize.config import DEFAULT_GEN_LM
 
-        focus_gen_model = args.gen_model or DEFAULT_GEN_LM
         if args.all:
             # Defer per-skill focus application to the loop below
             pass
@@ -304,7 +308,7 @@ def main():
             apply_focus(
                 skill_name=args.skill_name,
                 focus_areas=focus_areas,
-                gen_model=focus_gen_model,
+                gen_model=args.focus_model,
             )
 
     # Handle --apply-last: load saved result and apply without re-running
@@ -391,12 +395,11 @@ def main():
             # Apply focus per-skill in --all mode
             if focus_areas:
                 from focus import apply_focus
-                from skill_test.optimize.config import DEFAULT_GEN_LM
 
                 apply_focus(
                     skill_name=name,
                     focus_areas=focus_areas,
-                    gen_model=args.gen_model or DEFAULT_GEN_LM,
+                    gen_model=args.focus_model,
                 )
             try:
                 result = optimize_skill(

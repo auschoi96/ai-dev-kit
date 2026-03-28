@@ -60,7 +60,14 @@ async def lifespan(app: FastAPI):
         await start_token_refresh()
 
       # Run migrations in background thread (non-blocking)
-      asyncio.create_task(asyncio.to_thread(run_migrations))
+      async def _run_migrations_with_logging():
+        try:
+          await asyncio.to_thread(run_migrations)
+          logger.info("Database migrations completed successfully")
+        except Exception as e:
+          logger.error(f"Database migration failed: {e}")
+
+      await _run_migrations_with_logging()
 
       # Start backup worker
       start_backup_worker()
