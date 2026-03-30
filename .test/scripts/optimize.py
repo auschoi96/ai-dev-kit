@@ -141,25 +141,6 @@ def main():
         default=None,
         help="Directory for GEPA checkpoints. Resumes from last state if dir exists.",
     )
-    # Evaluation mode flags
-    parser.add_argument(
-        "--proxy",
-        action="store_true",
-        help="Use proxy (SkillBench) evaluator only. Faster but less accurate — "
-        "tests text generation, not real agent behavior.",
-    )
-    parser.add_argument(
-        "--agent-eval",
-        action="store_true",
-        help="Hybrid mode: use real Claude Code agent for baseline + validation, "
-        "proxy for GEPA iterations. This is the DEFAULT when not using --proxy.",
-    )
-    parser.add_argument(
-        "--agent-eval-full",
-        action="store_true",
-        help="Full agent mode: use real Claude Code agent for ALL GEPA iterations "
-        "(slow but most accurate).",
-    )
     parser.add_argument(
         "--agent-model",
         default=None,
@@ -177,7 +158,7 @@ def main():
         type=int,
         default=3,
         help="Number of parallel agent evaluations (default: 3). "
-        "Only affects --agent-eval and --agent-eval-full modes.",
+        "Controls concurrency for agent evaluations.",
     )
     parser.add_argument(
         "--mlflow-experiment",
@@ -190,6 +171,15 @@ def main():
         metavar="EXPERIMENT_ID",
         help="MLflow experiment ID with ToolCallCorrectness/ToolCallEfficiency assessments. "
         "Injects real-world behavioral feedback into GEPA's reflection context.",
+    )
+
+    parser.add_argument(
+        "--feedback",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Path to feedback.json from a prior evaluation (Step 1). "
+        "Human feedback is injected into GEPA's reflection context.",
     )
 
     parser.add_argument(
@@ -231,14 +221,6 @@ def main():
 
     if not args.skill_name and not args.all and not args.tools_only:
         parser.error("Either provide a skill name or use --all")
-
-    # --focus requires agent evaluation (incompatible with --proxy)
-    if (args.focus_areas or args.focus_file) and args.proxy:
-        parser.error("--focus requires agent evaluation (incompatible with --proxy)")
-
-    # Default to agent eval (hybrid) unless --proxy is set
-    if not args.proxy and not args.agent_eval and not args.agent_eval_full:
-        args.agent_eval = True
 
     from skill_test.optimize.runner import optimize_skill
     from skill_test.optimize.review import (
@@ -356,8 +338,6 @@ def main():
                 judge_model=args.judge_model,
                 align=args.align,
                 run_dir=args.run_dir,
-                agent_eval=args.agent_eval,
-                agent_eval_full=args.agent_eval_full,
                 agent_model=args.agent_model,
                 agent_timeout=args.agent_timeout,
                 mlflow_experiment=args.mlflow_experiment,
@@ -417,8 +397,6 @@ def main():
                     judge_model=args.judge_model,
                     align=args.align,
                     run_dir=f"{args.run_dir}/{name}" if args.run_dir else None,
-                    agent_eval=args.agent_eval,
-                    agent_eval_full=args.agent_eval_full,
                     agent_model=args.agent_model,
                     agent_timeout=args.agent_timeout,
                     mlflow_experiment=args.mlflow_experiment,
@@ -464,13 +442,12 @@ def main():
                 judge_model=args.judge_model,
                 align=args.align,
                 run_dir=args.run_dir,
-                agent_eval=args.agent_eval,
-                agent_eval_full=args.agent_eval_full,
                 agent_model=args.agent_model,
                 agent_timeout=args.agent_timeout,
                 mlflow_experiment=args.mlflow_experiment,
                 focus_areas=focus_areas,
                 parallel_agents=args.parallel_agents,
+                feedback_path=args.feedback,
             )
             review_optimization(result)
             if args.apply and not args.dry_run:

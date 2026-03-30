@@ -36,7 +36,7 @@ def save_detailed_run_results(result: OptimizationResult) -> Path | None:
     Returns:
         Path to the run directory, or None if no side_info available.
     """
-    si = result.skillbench_side_info or {}
+    si = result.side_info or {}
     if not si:
         return None
 
@@ -56,7 +56,7 @@ def save_detailed_run_results(result: OptimizationResult) -> Path | None:
         "original_token_count": result.original_token_count,
         "optimized_token_count": result.optimized_token_count,
         "token_reduction_pct": result.token_reduction_pct,
-        "evaluator_type": getattr(result, "evaluator_type", "skillbench"),
+        "evaluator_type": getattr(result, "evaluator_type", "agent"),
         "mlflow_run_id": result.mlflow_run_id,
         "task_count": len(si),
         "tasks": {},
@@ -255,7 +255,7 @@ def review_optimization(result: OptimizationResult) -> None:
     print(f"  Optimization Results: {result.skill_name}")
     print(f"{'=' * 60}")
 
-    si = result.skillbench_side_info or {}
+    si = result.side_info or {}
 
     # Aggregate judge-based scores from per-task side_info
     task_count = 0

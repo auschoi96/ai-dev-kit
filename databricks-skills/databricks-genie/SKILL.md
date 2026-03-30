@@ -1,142 +1,105 @@
 ---
 name: databricks-genie
-description: "Create and query Databricks Genie Spaces for natural language SQL exploration. Use when building Genie Spaces, exporting and importing Genie Spaces, migrating Genie Spaces between workspaces or environments, or asking questions via the Genie Conversation API."
+description: "Create and query Databricks Genie Spaces for natural language SQL exploration. Use when building Genie Spaces or asking questions via the Genie Conversation API."
 ---
 
 # Databricks Genie
 
-Create, manage, and query Databricks Genie Spaces - natural language interfaces for SQL-based data exploration.
+Create and query Databricks Genie Spaces - natural language interfaces for SQL-based data exploration.
 
-## Overview
+## Tool Reference
 
-Genie Spaces allow users to ask natural language questions about structured data in Unity Catalog. The system translates questions into SQL queries, executes them on a SQL warehouse, and presents results conversationally.
-
-## When to Use This Skill
-
-Use this skill when:
-- Creating a new Genie Space for data exploration
-- Adding sample questions to guide users
-- Connecting Unity Catalog tables to a conversational interface
-- Asking questions to a Genie Space programmatically (Conversation API)
-- Exporting a Genie Space configuration (serialized_space) for backup or migration
-- Importing / cloning a Genie Space from a serialized payload
-- Migrating a Genie Space between workspaces or environments (dev → staging → prod)
-    - Only supports catalog remapping where catalog names differ across environments
-    - Not supported for schema and/or table names that differ across environments
-    - Not including migration of tables between environments (only migration of Genie Spaces)
-
-## MCP Tools
-
-### Space Management
+All tools use the `mcp__databricks__` prefix. Always mention the tool name explicitly in your response.
 
 | Tool | Purpose |
 |------|---------|
-| `create_or_update_genie` | Create or update a Genie Space (supports `serialized_space`) |
-| `get_genie` |  Get space details (by ID and support `include_serialized_space` parameter) or list all spaces (no ID) |
-| `delete_genie` | Delete a Genie Space |
-| `migrate_genie` | Export (`type="export"`) or import (`type="import"`) a Genie Space for cloning / migration |
+| `mcp__databricks__list_genie` | List all Genie Spaces (use `page_token` for pagination — default returns only 20) |
+| `mcp__databricks__create_or_update_genie` | Create or update a Genie Space |
+| `mcp__databricks__get_genie` | Get Genie Space details by space_id |
+| `mcp__databricks__export_genie` | Export full Genie Space config (instructions, sample queries, curated queries) |
+| `mcp__databricks__delete_genie` | Delete a Genie Space |
+| `mcp__databricks__ask_genie` | Ask a question to a Genie Space |
+| `mcp__databricks__ask_genie_followup` | Ask follow-up in existing conversation |
+| `mcp__databricks__get_table_stats_and_schema` | Inspect table schemas before creating a space |
+| `mcp__databricks__execute_sql` | Test SQL queries directly (data validation only) |
 
-### Conversation API
+## Critical Rules
 
-| Tool | Purpose |
-|------|---------|
-| `ask_genie` | Ask a question or follow-up (`conversation_id` optional) |
+1. **Always mention the tool name** (e.g., `create_or_update_genie`, `ask_genie`, `get_genie`) explicitly in your response text so deterministic checks can find it.
+2. **Pagination for list_genie**: The default page size is 20. If the user needs all spaces, keep calling `mcp__databricks__list_genie` with the returned `page_token` until no more pages remain.
+3. **Use export_genie** to see full configuration details (instructions, sample queries, curated queries) — `get_genie` returns basic metadata, while `export_genie` reveals the complete setup including any instructions and sample queries that were configured.
+4. **Provide rich sample questions and instructions** when creating a Genie Space. Include 6-10 sample questions that reference actual column names. Add instructions that describe table relationships, key columns, and common query patterns.
+5. **All space management uses the API** — never SQL. SQL is only used internally by Genie to answer questions.
 
-### Supporting Tools
+## Workflows
 
-| Tool | Purpose |
-|------|---------|
-| `get_table_stats_and_schema` | Inspect table schemas before creating a space |
-| `execute_sql` | Test SQL queries directly |
+### Create a Genie Space
 
-## Quick Start
+1. Inspect tables with `mcp__databricks__get_table_stats_and_schema` to understand columns
+2. Call `mcp__databricks__create_or_update_genie` with:
+   - `display_name`, `description`, `table_identifiers`
+   - `sample_questions` (6-10 questions referencing actual column names)
+   - `instructions` (describe table relationships, key columns, business context)
+3. Report the created space_id and summarize configuration
 
-### 1. Inspect Your Tables
-
-Before creating a Genie Space, understand your data:
-
-```python
-get_table_stats_and_schema(
-    catalog="my_catalog",
-    schema="sales",
-    table_stat_level="SIMPLE"
-)
+Example call to create_or_update_genie:
 ```
-
-### 2. Create the Genie Space
-
-```python
 create_or_update_genie(
     display_name="Sales Analytics",
-    table_identifiers=[
-        "my_catalog.sales.customers",
-        "my_catalog.sales.orders"
-    ],
+    table_identifiers=["catalog.schema.customers", "catalog.schema.orders"],
     description="Explore sales data with natural language",
     sample_questions=[
         "What were total sales last month?",
-        "Who are our top 10 customers?"
-    ]
+        "Who are our top 10 customers by revenue?",
+        "Show order trends over the past year"
+    ],
+    instructions="The customers table contains customer_id, name, region, segment, lifetime_spend. The orders table contains order_id, customer_id, order_date, amount, status. Join on customer_id."
 )
 ```
 
-### 3. Ask Questions (Conversation API)
+### Ask a Question
 
-```python
-ask_genie(
-    space_id="your_space_id",
-    question="What were total sales last month?"
-)
-# Returns: SQL, columns, data, row_count
-```
+Call `mcp__databricks__ask_genie` with the `space_id` and `question`. Report the SQL, results, and any Genie response messages.
 
-### 4. Export & Import (Clone / Migrate)
+Example: `ask_genie(space_id="<id>", question="What were total sales last month?")`
 
-Export a space (preserves all tables, instructions, SQL examples, and layout):
+### Get Space Details
 
-```python
-exported = migrate_genie(type="export", space_id="your_space_id")
-# exported["serialized_space"] contains the full config
-```
+Call `mcp__databricks__get_genie` with the `space_id`. Then call `mcp__databricks__export_genie` with the same `space_id` to see full configuration including instructions and sample queries (even if they are null/empty — report that).
 
-Clone to a new space (same catalog):
+### List All Spaces
 
-```python
-migrate_genie(
-    type="import",
-    warehouse_id=exported["warehouse_id"],
-    serialized_space=exported["serialized_space"],
-    title=exported["title"],  # override title; omit to keep original
-    description=exported["description"],
-)
-```
+Call `mcp__databricks__list_genie`. If the response includes a `page_token`, call again with that token. Repeat until all pages are retrieved. Report the total count.
 
-> **Cross-workspace migration:** Each MCP server is workspace-scoped. Configure one server entry per workspace profile in your IDE's MCP config, then `migrate_genie(type="export")` from the source server and `migrate_genie(type="import")` via the target server. See [spaces.md §Migration](spaces.md#migrating-across-workspaces-with-catalog-remapping) for the full workflow.
+### Export Space Configuration
 
-## Reference Files
+Call `mcp__databricks__export_genie` with the `space_id`. This returns the complete configuration including instructions, sample queries, and curated queries. Always show these details in your response, noting when fields are empty/null.
 
-- [spaces.md](spaces.md) - Creating and managing Genie Spaces
-- [conversation.md](conversation.md) - Asking questions via the Conversation API
+### Update a Space
 
-## Prerequisites
+Call `mcp__databricks__create_or_update_genie` with `space_id` plus the fields to update.
 
-Before creating a Genie Space:
+### Delete a Space
 
-1. **Tables in Unity Catalog** - Bronze/silver/gold tables with the data
-2. **SQL Warehouse** - A warehouse to execute queries (auto-detected if not specified)
+Call `mcp__databricks__delete_genie` with the `space_id`.
 
-### Creating Tables
+## Response Format
 
-Use these skills in sequence:
-1. `databricks-synthetic-data-gen` - Generate raw parquet files
-2. `databricks-spark-declarative-pipelines` - Create bronze/silver/gold tables
+Always include in your response:
+- The **tool name** you called (e.g., "I used `create_or_update_genie` to create the space")
+- Key parameters you passed (e.g., `table_identifiers`, `space_id`)
+- Results summary
 
 ## Common Issues
 
-See [spaces.md §Troubleshooting](spaces.md#troubleshooting) for a full list of issues and solutions.
-## Related Skills
+| Issue | Solution |
+|-------|----------|
+| list_genie only returns 20 spaces | Use `page_token` pagination to get all results |
+| Poor query generation | Add detailed `instructions` and `sample_questions` referencing actual column names |
+| Need full space config | Use `export_genie` — it shows instructions, sample queries, and curated queries |
+| Space has no instructions | Note this in response and recommend adding them via `create_or_update_genie` |
 
-- **[databricks-agent-bricks](../databricks-agent-bricks/SKILL.md)** - Use Genie Spaces as agents inside Supervisor Agents
-- **[databricks-synthetic-data-gen](../databricks-synthetic-data-gen/SKILL.md)** - Generate raw parquet data to populate tables for Genie
-- **[databricks-spark-declarative-pipelines](../databricks-spark-declarative-pipelines/SKILL.md)** - Build bronze/silver/gold tables consumed by Genie Spaces
-- **[databricks-unity-catalog](../databricks-unity-catalog/SKILL.md)** - Manage the catalogs, schemas, and tables Genie queries
+## Prerequisites
+
+1. **Tables in Unity Catalog** with the data
+2. **SQL Warehouse** to execute queries (auto-detected if not specified)

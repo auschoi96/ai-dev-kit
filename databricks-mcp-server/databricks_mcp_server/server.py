@@ -132,6 +132,32 @@ if sys.platform == "win32":
 # Register middleware (see middleware.py for details on each)
 mcp.add_middleware(TimeoutHandlingMiddleware())
 
+
+def _patch_tool_decorator_for_timeout_compat():
+    """Strip unsupported kwargs (e.g. ``timeout``) from @mcp.tool() calls.
+
+    Some FastMCP versions (< 3.x) don't accept ``timeout`` as a keyword
+    argument.  Rather than removing ``timeout=`` from every tool module,
+    we intercept the decorator and silently drop kwargs that the
+    underlying FastMCP.tool() doesn't understand.
+    """
+    original_tool = mcp.tool
+
+    @functools.wraps(original_tool)
+    def compat_tool(fn=None, *args, **kwargs):
+        # Remove kwargs not supported by this FastMCP version
+        sig = inspect.signature(original_tool)
+        unsupported = [k for k in kwargs if k not in sig.parameters]
+        for k in unsupported:
+            kwargs.pop(k)
+        return original_tool(fn, *args, **kwargs)
+
+    mcp.tool = compat_tool
+
+
+# Ensure @mcp.tool(timeout=...) works across FastMCP versions
+_patch_tool_decorator_for_timeout_compat()
+
 # Apply async wrapper on Windows to prevent event loop deadlocks.
 # TODO: FastMCP 3.x automatically wraps sync functions in asyncio.to_thread().
 #       Test if this Windows-specific patch is still needed with FastMCP 3.x.

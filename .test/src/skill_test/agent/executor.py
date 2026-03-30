@@ -190,8 +190,16 @@ def _find_repo_root() -> str:
 
 
 def _load_mcp_config() -> dict[str, Any]:
-    """Load MCP server config from .mcp.json, resolving variable references."""
+    """Load MCP server config from .mcp.json, resolving variable references.
+
+    Resolves ``${CLAUDE_PLUGIN_ROOT}`` to the repo root and strips
+    ``defer_loading`` (not relevant for the agent SDK).  If the configured
+    Python interpreter does not exist on disk, falls back to ``sys.executable``
+    so tests work across conda / venv / system-python setups.
+    """
     import json
+    import shutil
+    import sys
     from pathlib import Path
 
     repo_root = Path(_find_repo_root())
@@ -219,9 +227,58 @@ def _load_mcp_config() -> dict[str, Any]:
                 ]
             else:
                 resolved_cfg[key] = val
+
+        # Fall back to current Python if the configured interpreter is missing.
+        # This handles .mcp.json referencing .venv/bin/python when the env uses
+        # conda, system python, or a differently-named venv.
+        cmd = resolved_cfg.get("command", "")
+        if cmd and not Path(cmd).exists() and not shutil.which(cmd):
+            original = cmd
+            resolved_cfg["command"] = sys.executable
+            logger.warning(
+                "MCP server '%s': configured python '%s' not found, falling back to '%s'",
+                name, original, sys.executable,
+            )
+
         if resolved_cfg:
             resolved[name] = resolved_cfg
     return resolved
+
+
+def _discover_mcp_tool_names(
+    mcp_config: dict[str, Any],
+    tool_modules: list[str] | None = None,
+) -> list[str]:
+    """Discover MCP tool names, optionally filtered by module.
+
+    Claude Code names MCP tools as ``mcp__<server>__<tool>``.  Uses
+    AST-based extraction from :func:`extract_tool_descriptions` so we
+    don't need to import (and thus *start*) the full MCP server just to
+    enumerate tool names.
+
+    When *tool_modules* is provided (e.g. ``["genie", "sql"]`` from
+    ``manifest.yaml``), only tools in those modules are returned.  This
+    keeps the ``allowed_tools`` list small and avoids hitting the Claude
+    CLI's JSON-message buffer limit with 70+ tool schemas.
+
+    Falls back to an empty list if extraction fails.
+    """
+    tool_names: list[str] = []
+    for server_name in mcp_config:
+        try:
+            from ..optimize.tools import extract_tool_descriptions
+
+            tool_map = extract_tool_descriptions(modules=tool_modules)
+            for module_tools in tool_map.values():
+                for td in module_tools:
+                    tool_names.append(f"mcp__{server_name}__{td.name}")
+            logger.info(
+                "Discovered %d MCP tools for server '%s' (modules=%s)",
+                len(tool_names), server_name, tool_modules or "all",
+            )
+        except Exception as e:
+            logger.warning("Could not discover MCP tools for '%s': %s", server_name, e)
+    return tool_names
 
 
 _ENV_PREFIXES = (
@@ -389,6 +446,15 @@ def _get_mlflow_stop_hook(mlflow_experiment: str | None = None, skill_name: str 
                     )
                     return None
 
+            # Disable the MlflowV3SpanExporter in the parent process.
+            # process_transcript() creates spans that trigger the exporter,
+            # which tries to upload trace artifacts to S3 via presigned URLs.
+            # If the experiment's artifact_location is under .jobs/ DBFS,
+            # those URLs are not writable from outside the workspace (403).
+            # Tracing is only for observability — the evaluation pipeline
+            # does not depend on it.
+            mlflow.tracing.disable()
+
             print(f"    [MLflow] Tracing configured: uri={tracking_uri} experiment={experiment_name}")
             _mlflow_env_configured = True
 
@@ -396,9 +462,23 @@ def _get_mlflow_stop_hook(mlflow_experiment: str | None = None, skill_name: str 
         """Upload transcript to MLflow in the background (best-effort).
 
         Judges are field-based and don't consume MLflow traces, so this is
-        purely for observability logging.  Fire-and-forget avoids blocking
-        the evaluation pipeline on slow HTTP I/O to the tracking server.
+        purely for observability logging.  Disabled by default because the
+        MlflowV3SpanExporter tries to upload trace artifacts to S3 via
+        presigned URLs, which fail with 403 when the experiment's
+        artifact_location is under .jobs/ DBFS.
+
+        Set SKILL_TEST_UPLOAD_TRACES=true to enable.
         """
+        if not os.environ.get("SKILL_TEST_UPLOAD_TRACES", "").lower() in ("1", "true", "yes"):
+            logger.debug("Trace upload skipped (set SKILL_TEST_UPLOAD_TRACES=true to enable)")
+            return
+
+        # Suppress the mlflow_v3 exporter warnings — if the S3 presigned
+        # URL fails, the WARNING is logged by MLflow internals before our
+        # exception handler runs.  Raising the level prevents noisy output.
+        _exporter_logger = logging.getLogger("mlflow.tracing.export.mlflow_v3")
+        _prev_level = _exporter_logger.level
+        _exporter_logger.setLevel(logging.ERROR)
         try:
             setup_mlflow()
             loop = asyncio.get_running_loop()
@@ -427,6 +507,8 @@ def _get_mlflow_stop_hook(mlflow_experiment: str | None = None, skill_name: str 
             print(f"    [MLflow] Warning: background trace upload timed out (session={session_id})")
         except Exception as e:
             print(f"    [MLflow] Warning: background trace upload failed: {e}")
+        finally:
+            _exporter_logger.setLevel(_prev_level)
 
     async def mlflow_stop_hook(input_data, tool_use_id, context):
         """Fire-and-forget transcript upload when agent stops.
@@ -456,6 +538,7 @@ async def run_agent(
     model: str | None = None,
     mlflow_experiment: str | None = None,
     skill_name: str | None = None,
+    tool_modules: list[str] | None = None,
 ) -> AgentResult:
     """Run a Claude Code agent with optional skill injection.
 
@@ -468,6 +551,9 @@ async def run_agent(
         cwd: Working directory for the agent. Defaults to current dir.
         timeout_seconds: Maximum execution time. Default 300s (5 min).
         model: Override the model to use (via env var).
+        tool_modules: Optional list of MCP tool modules to expose (e.g.
+            ``["genie", "sql"]``).  When set, only tools from those modules
+            are added to allowed_tools.  Sourced from manifest.yaml.
 
     Returns:
         AgentResult with response text, trace metrics, and raw events.
@@ -501,13 +587,19 @@ async def run_agent(
         if mcp_config:
             logger.info("Auto-loaded MCP config: %s", list(mcp_config.keys()))
 
-    # Build options
+    # Build allowed_tools list.
+    # bypassPermissions alone doesn't auto-approve MCP tool calls — they must
+    # also appear in allowed_tools.  Discover MCP tool names by importing the
+    # server's tool registry so the agent can call them without a permission
+    # prompt.
+    _BUILTIN_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
     if allowed_tools is None:
         if mcp_config:
-            # MCP tools are discovered dynamically — don't restrict
-            allowed_tools = None
+            mcp_tool_names = _discover_mcp_tool_names(mcp_config, tool_modules=tool_modules)
+            allowed_tools = _BUILTIN_TOOLS + mcp_tool_names
+            logger.info("Allowed tools: %d builtin + %d MCP", len(_BUILTIN_TOOLS), len(mcp_tool_names))
         else:
-            allowed_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+            allowed_tools = list(_BUILTIN_TOOLS)
 
     env = _get_agent_env()
     if model:
@@ -516,12 +608,33 @@ async def run_agent(
     # Instead of mutating os.environ (not thread-safe), exclude it from the subprocess env.
     env.pop("CLAUDECODE", None)
 
-    # Pass Databricks auth env vars to MCP server processes
+    # Pass environment to MCP server processes.
+    # The MCP server config is serialized as JSON over stdio to the Claude CLI.
+    # Passing the FULL os.environ can exceed the 1MB message buffer, so we only
+    # include vars the MCP server actually needs: auth, PATH, HOME, and Python.
     if mcp_config:
-        mcp_env = {k: v for k, v in env.items() if k.startswith(("DATABRICKS_",))}
+        _ESSENTIAL_KEYS = {"PATH", "HOME", "USER", "SHELL", "LANG", "PYTHONPATH",
+                           "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"}
+        mcp_env: dict[str, str] = {}
+        # Essential vars for the subprocess to function
+        for k in _ESSENTIAL_KEYS:
+            if k in os.environ:
+                mcp_env[k] = os.environ[k]
+        # All DATABRICKS_* / MLFLOW_* auth vars from agent env
+        for k, v in env.items():
+            if k.startswith(("DATABRICKS_", "MLFLOW_")):
+                mcp_env[k] = v
+        # Also pick up any DATABRICKS_* from os.environ not already in agent env
+        for k, v in os.environ.items():
+            if k.startswith("DATABRICKS_") and k not in mcp_env:
+                mcp_env[k] = v
         for _server_name, server_cfg in mcp_config.items():
-            if "env" not in server_cfg and mcp_env:
-                server_cfg["env"] = mcp_env
+            if "env" not in server_cfg:
+                server_cfg["env"] = dict(mcp_env)
+            else:
+                # Merge auth vars into existing env without clobbering user overrides
+                for k, v in mcp_env.items():
+                    server_cfg["env"].setdefault(k, v)
 
     # Set up MLflow tracing via Stop hook (fire-and-forget for observability)
     mlflow_hook = _get_mlflow_stop_hook(mlflow_experiment=mlflow_experiment, skill_name=skill_name)
@@ -536,7 +649,25 @@ async def run_agent(
         stripped = line.strip()
         if stripped:
             stderr_lines.append(stripped)
-            logger.debug("[Claude stderr] %s", stripped)
+            # Surface MCP-related errors at warning level so they're visible
+            if any(kw in stripped.lower() for kw in ("error", "traceback", "import", "mcp", "failed")):
+                logger.warning("[Claude stderr] %s", stripped)
+            else:
+                logger.debug("[Claude stderr] %s", stripped)
+
+    # Log MCP configuration for debugging tool discovery issues
+    if mcp_config:
+        for srv_name, srv_cfg in mcp_config.items():
+            cmd = srv_cfg.get("command", "?")
+            args = srv_cfg.get("args", [])
+            has_env = "env" in srv_cfg
+            logger.info(
+                "MCP server '%s': command=%s args=%s env_set=%s",
+                srv_name, cmd, args, has_env,
+            )
+            print(f"    [MCP] Server '{srv_name}': {cmd} {' '.join(str(a) for a in args)}")
+    else:
+        logger.info("No MCP servers configured — using builtin tools only: %s", allowed_tools)
 
     options = ClaudeAgentOptions(
         cwd=cwd or os.getcwd(),
@@ -548,6 +679,7 @@ async def run_agent(
         env=env,
         hooks=hooks if hooks else None,
         stderr=_stderr_callback,
+        max_buffer_size=5 * 1024 * 1024,  # 5MB — MCP tool schemas can exceed 1MB default
     )
 
     start_time = time.monotonic()

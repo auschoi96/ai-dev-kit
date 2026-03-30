@@ -79,12 +79,19 @@ def extract_tool_descriptions(
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
-            # Check if decorated with @mcp.tool
+            # Check if decorated with @mcp.tool or @mcp.tool(...)
             for dec in node.decorator_list:
                 is_mcp_tool = False
+                # @mcp.tool (bare decorator)
                 if isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Name):
                     if dec.value.id == "mcp" and dec.attr == "tool":
                         is_mcp_tool = True
+                # @mcp.tool(timeout=60) (call with kwargs)
+                elif isinstance(dec, ast.Call):
+                    func = dec.func
+                    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                        if func.value.id == "mcp" and func.attr == "tool":
+                            is_mcp_tool = True
                 elif isinstance(dec, ast.Name) and dec.id == "mcp":
                     is_mcp_tool = True
                 if is_mcp_tool:

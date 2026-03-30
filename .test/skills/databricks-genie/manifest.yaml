@@ -17,16 +17,26 @@ scorers:
   - Response must address the user's request completely
   - Code examples must follow documented best practices
   - Response must use modern APIs (not deprecated ones)
+  - The agent should use MCP tools directly rather than suggesting manual workarounds
   trace_expectations:
     tool_limits:
       Bash: 10
       Read: 20
     token_budget:
       max_total: 100000
-    required_tools:
-    - Read
+    required_tools: []
     banned_tools: []
     expected_files: []
+    # MCP tools that should be discoverable during evaluation.
+    # These come from databricks-mcp-server/tools/genie.py and tools/sql.py
+    discoverable_mcp_tools:
+    - mcp__databricks__create_or_update_genie
+    - mcp__databricks__get_genie
+    - mcp__databricks__delete_genie
+    - mcp__databricks__migrate_genie
+    - mcp__databricks__ask_genie
+    - mcp__databricks__get_table_stats_and_schema
+    - mcp__databricks__execute_sql
 quality_gates:
   syntax_valid: 1.0
   pattern_adherence: 0.9

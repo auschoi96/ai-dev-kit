@@ -1,22 +1,13 @@
 """Agent-based evaluator: run real Claude Code agent and score behavior.
 
 GEPA-compatible evaluator that runs a Claude Code instance via the Agent SDK,
-captures the full execution trace, and scores using focused field-based MLflow
-judges plus deterministic scorers.
+captures the full execution trace, and scores using a semantic assertion
+grader (hybrid deterministic + LLM) plus deterministic trace scorers.
 
-Each focused judge asks ONE clear question and makes 1 LLM call using
-``{{ inputs }}/{{ outputs }}`` templates (no agentic tool-calling loop).
-Eval criteria are loaded on-demand via ``skills=`` parameter when supported.
-
-Scoring weights:
-  20% Effectiveness delta (WITH vs WITHOUT, per-dimension)
-  20% Correctness (field-based judge: facts, APIs, code syntax)
-  15% Completeness (field-based judge: task completion, coverage)
-  15% Guideline adherence (field-based judge: patterns, conventions)
-  15% Assertion coverage (deterministic: expected_facts + expected_patterns)
-   5% Execution success (deterministic: tool call success ratio)
-   5% Token efficiency (deterministic: candidate size)
-  -5% Regression penalty (conditional: regression judge)
+Scoring matches evaluate.py: compute_score(diagnostics) with defaults
+(token_efficiency=1.0, structure=1.0). Behavioral scorers and
+execution_success are still computed for GEPA reflection context
+but do not affect the final score.
 """
 
 from __future__ import annotations
@@ -24,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -34,16 +26,10 @@ from ..scorers.trace import (
     banned_tools as banned_tools_scorer,
     tool_sequence as tool_sequence_scorer,
 )
-from .assertions import run_all_assertions, summarize_failures
-from .judges import (
-    JudgeFeedback,
-    _safe_parse_score,
-    create_correctness_judge,
-    create_completeness_judge,
-    create_guideline_adherence_judge,
-    create_regression_judge,
-    discover_skill_paths,
-    run_judge_safe,
+from .semantic_grader import (
+    grade_with_without,
+    build_side_info,
+    compute_score,
 )
 from .utils import count_tokens
 
@@ -109,27 +95,20 @@ def _compute_execution_success(agent_result: AgentResult) -> float:
 
 
 class AgentEvaluator:
-    """GEPA-compatible evaluator using real Claude Code agent + focused judges.
+    """GEPA-compatible evaluator using real Claude Code agent + semantic grader.
 
-    Three focused field-based judges (correctness, completeness, guideline
-    adherence) each ask ONE clear question and make 1 LLM call.  They use
-    ``{{ inputs }}/{{ outputs }}`` templates — no agentic tool-calling loop.
-
-    Eval criteria are loaded on-demand via ``skills=`` parameter on
-    ``make_judge()`` when supported by MLflow (PR #21725).
-
-    Deterministic assertions and trace scorers remain as the static spine.
+    Runs a real Claude Code agent, captures the execution trace, and scores
+    using a semantic assertion grader (hybrid deterministic + LLM) plus
+    deterministic trace scorers for behavioral compliance.
 
     Args:
         original_token_counts: Token counts of original artifacts for efficiency scoring.
         token_budget: Hard token ceiling.
-        skill_guidelines: Guidelines from ground_truth.yaml and manifest.yaml.
-        judge_model: LLM model for judges (from ``--judge-model``).
+        judge_model: LLM model for semantic grading (from ``--judge-model``).
         mcp_config: MCP server configuration for the agent.
         allowed_tools: Allowed tools for the agent.
         agent_model: Model to use for the agent execution (from ``--agent-model``).
         agent_timeout: Timeout for each agent run in seconds.
-        tool_modules: MCP tool modules from manifest.yaml for criteria filtering.
     """
 
     def __init__(
@@ -149,12 +128,20 @@ class AgentEvaluator:
         self._original_token_counts = original_token_counts or {}
         self._total_original_tokens = sum(self._original_token_counts.values())
         self._token_budget = token_budget
+        self._judge_model = judge_model
         self._mcp_config = mcp_config
         self._allowed_tools = allowed_tools
         self._agent_model = agent_model
         self._agent_timeout = agent_timeout
         self._mlflow_experiment = mlflow_experiment
         self._skill_name = skill_name
+        self._tool_modules = tool_modules
+
+        # Export resolved agent auth vars into os.environ so the semantic
+        # grader (which runs in-process, not in the agent subprocess) can
+        # read ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN and route through
+        # the same Databricks AI Gateway endpoint as the agent.
+        self._inject_grader_env()
 
         # Cache WITH-skill evaluation results keyed on (prompt_hash, candidate_hash)
         self._with_skill_cache: dict[str, tuple[float, dict]] = {}
@@ -162,23 +149,29 @@ class AgentEvaluator:
         # Caches for WITHOUT-skill runs (keyed by prompt hash)
         self._baseline_response_cache: dict[str, str] = {}
         self._baseline_trace_cache: dict[str, dict] = {}
-        # Per-judge baseline caches (WITHOUT results are stable per prompt)
-        self._baseline_correctness_cache: dict[str, JudgeFeedback] = {}
-        self._baseline_completeness_cache: dict[str, JudgeFeedback] = {}
         self._cache_lock = threading.Lock()
 
-        # --- Skill discovery (static spine + adaptive layer) ---
-        skill_paths = discover_skill_paths(tool_modules=tool_modules)
+    @staticmethod
+    def _inject_grader_env() -> None:
+        """Set agent auth vars in os.environ for the in-process grader.
 
-        # --- Focused field-based judges (1 LLM call each) ---
-        self._correctness_judge = create_correctness_judge(skill_paths=skill_paths, judge_model=judge_model)
-        self._completeness_judge = create_completeness_judge(skill_paths=skill_paths, judge_model=judge_model)
-        self._guideline_judge = create_guideline_adherence_judge(
-            skill_paths=skill_paths,
-            skill_guidelines=skill_guidelines,
-            judge_model=judge_model,
-        )
-        self._regression_judge = create_regression_judge(judge_model=judge_model)
+        The semantic grader reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+        from os.environ.  These are normally only set in the agent subprocess
+        env (via _get_agent_env).  We load the same settings file here so
+        the grader hits the same Databricks AI Gateway endpoint.
+        """
+        from ..agent.executor import _get_agent_env
+
+        agent_env = _get_agent_env()
+        _AUTH_KEYS = {
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+            "ANTHROPIC_MODEL", "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        }
+        for key in _AUTH_KEYS:
+            if key in agent_env and key not in os.environ:
+                os.environ[key] = agent_env[key]
 
     def _run_agent(self, prompt: str, skill_md: str | None = None) -> AgentResult:
         """Run the agent and return result. Synchronous wrapper."""
@@ -191,6 +184,7 @@ class AgentEvaluator:
             model=self._agent_model,
             mlflow_experiment=self._mlflow_experiment,
             skill_name=self._skill_name,
+            tool_modules=self._tool_modules,
         )
 
     def _get_baseline(self, prompt: str) -> tuple[str, dict]:
@@ -274,239 +268,36 @@ class AgentEvaluator:
         with_response = with_result.response_text
         with_trace = with_result.trace_metrics.to_dict()
 
-        # Build expectations text for judges
-        facts = expectations.get("expected_facts", [])
-        patterns = expectations.get("expected_patterns", [])
-        guidelines = expectations.get("guidelines", [])
-
-        facts_str = "\n".join(f"- {f}" for f in facts) if facts else "None specified"
-        patterns_str = (
-            "\n".join(
-                f"- {p}" if isinstance(p, str) else f"- {p.get('description', p.get('pattern', ''))}" for p in patterns
-            )
-            if patterns
-            else "None specified"
-        )
-        guidelines_str = "\n".join(f"- {g}" for g in guidelines) if guidelines else "None specified"
-        expectations_text = (
-            f"Expected facts:\n{facts_str}\n\nExpected patterns:\n{patterns_str}\n\nGuidelines:\n{guidelines_str}"
-        )
-        expectations_dict = {"criteria": expectations_text}
-
-        baseline_key = _prompt_hash(prompt)
-
-        # Phase 3: Focused judge scoring (1 LLM call each, no trace/field fallback)
-
-        # Correctness: WITH + WITHOUT (WITHOUT cached)
-        correctness_with_fb = run_judge_safe(
-            self._correctness_judge,
-            inputs=prompt,
-            outputs=with_response,
-            expectations=expectations_dict,
-            name="correctness_with",
-        )
-        with self._cache_lock:
-            need_correctness_baseline = baseline_key not in self._baseline_correctness_cache
-        if need_correctness_baseline:
-            fb = run_judge_safe(
-                self._correctness_judge,
-                inputs=prompt,
-                outputs=without_response,
-                expectations=expectations_dict,
-                name="correctness_without",
-            )
-            with self._cache_lock:
-                if baseline_key not in self._baseline_correctness_cache:
-                    self._baseline_correctness_cache[baseline_key] = fb
-        with self._cache_lock:
-            correctness_without_fb = self._baseline_correctness_cache[baseline_key]
-
-        # Completeness: WITH + WITHOUT (WITHOUT cached)
-        completeness_with_fb = run_judge_safe(
-            self._completeness_judge,
-            inputs=prompt,
-            outputs=with_response,
-            expectations=expectations_dict,
-            name="completeness_with",
-        )
-        with self._cache_lock:
-            need_completeness_baseline = baseline_key not in self._baseline_completeness_cache
-        if need_completeness_baseline:
-            fb = run_judge_safe(
-                self._completeness_judge,
-                inputs=prompt,
-                outputs=without_response,
-                expectations=expectations_dict,
-                name="completeness_without",
-            )
-            with self._cache_lock:
-                if baseline_key not in self._baseline_completeness_cache:
-                    self._baseline_completeness_cache[baseline_key] = fb
-        with self._cache_lock:
-            completeness_without_fb = self._baseline_completeness_cache[baseline_key]
-
-        # Guideline adherence: WITH only
-        guideline_adherence_fb = run_judge_safe(
-            self._guideline_judge,
-            inputs=prompt,
-            outputs=with_response,
-            expectations=expectations_dict,
-            name="guideline_adherence",
+        # Phase 3: Agent-based grading (Claude Code grader with transcript)
+        with_transcript = [e.__dict__ if hasattr(e, '__dict__') else e for e in (with_result.events or [])]
+        with_results, without_results, diagnostics = grade_with_without(
+            with_response, without_response, expectations,
+            judge_model=self._judge_model,
+            with_transcript=with_transcript,
+            agent_model=self._agent_model,
         )
 
-        # Convert binary yes/no verdicts to float scores
-        correctness_with = _safe_parse_score(correctness_with_fb.value)
-        correctness_without = _safe_parse_score(correctness_without_fb.value)
-        completeness_with = _safe_parse_score(completeness_with_fb.value)
-        completeness_without = _safe_parse_score(completeness_without_fb.value)
-        guideline_adherence_score = _safe_parse_score(guideline_adherence_fb.value)
-
-        # Per-dimension effectiveness deltas
-        correctness_delta = correctness_with - correctness_without
-        completeness_delta = completeness_with - completeness_without
-        effectiveness_delta = (correctness_delta + completeness_delta) / 2.0
-
-        if effectiveness_delta > 0.05:
-            effectiveness_verdict = "improved"
-        elif effectiveness_delta < -0.05:
-            effectiveness_verdict = "regressed"
-        else:
-            effectiveness_verdict = "same"
-
-        # Regression judge (conditional on delta < -0.05)
-        regression_penalty = 0.0
-        regression_fb = None
-        if effectiveness_delta < -0.05:
-            comparison_input = (
-                f"QUESTION:\n{prompt}\n\n"
-                f"WITH-SKILL RESPONSE:\n{with_response}\n\n"
-                f"WITHOUT-SKILL RESPONSE:\n{without_response}"
-            )
-            regression_fb = run_judge_safe(
-                self._regression_judge,
-                inputs=comparison_input,
-                expectations=expectations_dict,
-                name="regression",
-            )
-            reg_val = regression_fb.value
-            if isinstance(reg_val, bool):
-                regression_penalty = 1.0 if reg_val else 0.0
-            elif isinstance(reg_val, str) and reg_val.strip().lower() in (
-                "yes",
-                "true",
-            ):
-                regression_penalty = 1.0
-
-        # Phase 4: Deterministic fact/pattern assertions (zero LLM cost — static spine)
-        with_assertion_results = run_all_assertions(with_response, expectations)
-        without_assertion_results = run_all_assertions(without_response, expectations)
-
-        fact_results = [r for r in with_assertion_results if r.assertion_type == "fact"]
-        pattern_results = [r for r in with_assertion_results if r.assertion_type == "pattern"]
-        fact_score = sum(1 for r in fact_results if r.passed) / len(fact_results) if fact_results else 1.0
-        pattern_score = sum(1 for r in pattern_results if r.passed) / len(pattern_results) if pattern_results else 1.0
-
-        failure_summary = summarize_failures(with_assertion_results, without_assertion_results)
-
-        # Phase 5: Deterministic trace scorers (static spine)
+        # Phase 4: Deterministic trace scorers (behavioral compliance)
         behavioral_score, behavioral_details = _run_behavioral_scorers(with_trace, trace_expectations)
         execution_success = _compute_execution_success(with_result)
 
-        # Phase 6: Token efficiency
+        # Phase 5: Composite score (matches evaluate.py defaults)
         total_candidate_tokens = sum(count_tokens(v) for v in candidate.values())
-        if self._total_original_tokens > 0:
-            ratio = total_candidate_tokens / self._total_original_tokens
-            if ratio <= 1.0:
-                token_efficiency = 1.0 + 0.15 * (1.0 - ratio)
-            else:
-                token_efficiency = max(0.0, 2.0 - ratio)
+        final_score, scores = compute_score(diagnostics)
 
-            if self._token_budget and total_candidate_tokens > self._token_budget:
-                over_ratio = total_candidate_tokens / self._token_budget
-                token_efficiency = min(token_efficiency, max(0.0, 2.0 - over_ratio))
-        else:
-            token_efficiency = 1.0
-
-        # Composite score
-        quality_composite = (correctness_with + completeness_with + guideline_adherence_score) / 3.0
-        assertion_coverage = 0.5 * fact_score + 0.5 * pattern_score
-
-        # Updated weights: assertion_coverage 10%→15%, effectiveness_delta 25%→20%
-        final_score = max(
-            0.0,
-            min(
-                1.0,
-                0.20 * effectiveness_delta
-                + 0.20 * correctness_with
-                + 0.15 * completeness_with
-                + 0.15 * guideline_adherence_score
-                + 0.15 * assertion_coverage
-                + 0.05 * execution_success
-                + 0.05 * token_efficiency
-                - 0.05 * regression_penalty,
-            ),
+        # Build side_info for GEPA reflection
+        reference_answer = example.get("answer", "")
+        side_info = build_side_info(
+            prompt=prompt,
+            with_results=with_results,
+            without_results=without_results,
+            diagnostics=diagnostics,
+            with_response=with_response,
+            without_response=without_response,
+            reference_answer=reference_answer,
         )
 
-        # Build rich side_info for GEPA reflection
-        side_info: dict[str, Any] = {}
-
-        if prompt:
-            side_info["Task"] = prompt[:500]
-
-        # Per-dimension judge feedback (GEPA renders each key as a markdown header)
-        side_info["Judge_correctness_with"] = {
-            "verdict": str(correctness_with_fb.value),
-            "score": correctness_with,
-            "rationale": correctness_with_fb.rationale,
-        }
-        side_info["Judge_correctness_without"] = {
-            "verdict": str(correctness_without_fb.value),
-            "score": correctness_without,
-            "rationale": correctness_without_fb.rationale,
-        }
-        side_info["Judge_completeness_with"] = {
-            "verdict": str(completeness_with_fb.value),
-            "score": completeness_with,
-            "rationale": completeness_with_fb.rationale,
-        }
-        side_info["Judge_completeness_without"] = {
-            "verdict": str(completeness_without_fb.value),
-            "score": completeness_without,
-            "rationale": completeness_without_fb.rationale,
-        }
-        side_info["Judge_guideline_adherence"] = {
-            "verdict": str(guideline_adherence_fb.value),
-            "score": guideline_adherence_score,
-            "rationale": guideline_adherence_fb.rationale,
-        }
-
-        # Per-dimension effectiveness deltas
-        side_info["Judge_effectiveness"] = {
-            "verdict": effectiveness_verdict,
-            "correctness_delta": correctness_delta,
-            "completeness_delta": completeness_delta,
-            "overall_delta": effectiveness_delta,
-        }
-
-        # Regression analysis (only when regression detected)
-        if regression_fb and regression_penalty > 0:
-            side_info["Regression_Analysis"] = {
-                "rationale": regression_fb.rationale,
-            }
-
-        # Assertion-based structured feedback
-        side_info["Missing_Facts"] = [r.rationale for r in fact_results if not r.passed]
-        side_info["Missing_Patterns"] = [r.rationale for r in pattern_results if not r.passed]
-        side_info["Passed_Facts"] = [r.rationale for r in fact_results if r.passed]
-        side_info["Passed_Patterns"] = [r.rationale for r in pattern_results if r.passed]
-
-        if failure_summary.get("Error") or failure_summary.get("Regressions"):
-            side_info["skill_md_specific_info"] = {
-                "Assertion_Diagnostics": failure_summary.get("Error", ""),
-                "Regressions": failure_summary.get("Regressions", ""),
-            }
-
-        # Agent-specific trace details
+        # Add agent-specific trace details
         side_info["agent_trace"] = {
             "total_tool_calls": with_trace.get("tools", {}).get("total_calls", 0),
             "tool_counts": with_trace.get("tools", {}).get("by_name", {}),
@@ -517,32 +308,8 @@ class AgentEvaluator:
         side_info["behavioral_scores"] = behavioral_details
         side_info["execution_success"] = execution_success
 
-        # Expected vs Actual
-        reference_answer = example.get("answer", "")
-        if reference_answer:
-            side_info["Expected"] = reference_answer[:2000]
-        if with_response:
-            side_info["Actual"] = with_response[:2000]
-
-        # Score breakdown (feeds GEPA's Pareto frontier)
-        side_info["scores"] = {
-            "correctness_with": correctness_with,
-            "correctness_without": correctness_without,
-            "completeness_with": completeness_with,
-            "completeness_without": completeness_without,
-            "guideline_adherence": guideline_adherence_score,
-            "quality_composite": quality_composite,
-            "correctness_delta": correctness_delta,
-            "completeness_delta": completeness_delta,
-            "skill_effectiveness": effectiveness_delta,
-            "regression_penalty": regression_penalty,
-            "fact_coverage": fact_score,
-            "pattern_adherence": pattern_score,
-            "execution_success": execution_success,
-            "token_efficiency": token_efficiency,
-            "final": final_score,
-        }
-
+        # Add scores and token counts
+        side_info["scores"] = scores
         side_info["token_counts"] = {
             "candidate_total": total_candidate_tokens,
             "original_total": self._total_original_tokens,
@@ -550,35 +317,48 @@ class AgentEvaluator:
         if self._token_budget:
             side_info["token_counts"]["budget"] = self._token_budget
 
-        # Diagnostic labels
-        weakest_dim = "correctness" if correctness_with <= completeness_with else "completeness"
-        weakest_score = min(correctness_with, completeness_with)
-
-        if failure_summary.get("Error"):
-            side_info["Error"] = failure_summary["Error"]
-        elif effectiveness_delta < -0.05:
-            regressed_dims = []
-            if correctness_delta < -0.05:
-                regressed_dims.append(f"correctness({correctness_delta:+.2f})")
-            if completeness_delta < -0.05:
-                regressed_dims.append(f"completeness({completeness_delta:+.2f})")
-            dims_str = ", ".join(regressed_dims) if regressed_dims else f"overall({effectiveness_delta:+.2f})"
-            side_info["Error"] = (
-                f"REGRESSION: {dims_str}. "
-                f"correctness: {correctness_with:.2f} (was {correctness_without:.2f}), "
-                f"completeness: {completeness_with:.2f} (was {completeness_without:.2f})"
-            )
-        elif weakest_score < 0.6:
-            side_info["Error"] = (
-                f"NEEDS_SKILL: weakest dimension is {weakest_dim}={weakest_score:.2f}. "
-                f"correctness={correctness_with:.2f}, completeness={completeness_with:.2f}, "
-                f"guideline_adherence={guideline_adherence_score:.2f}"
-            )
-
         # Store in candidate-level cache
         self._with_skill_cache[cache_key] = (final_score, side_info)
 
         return final_score, side_info
+
+
+def _collect_skill_guidelines(skill_name: str) -> list[str]:
+    """Collect and deduplicate guidelines from ground_truth.yaml and manifest.yaml."""
+    from pathlib import Path
+    import yaml
+
+    seen: set[str] = set()
+    guidelines: list[str] = []
+
+    gt_path = Path(".test/skills") / skill_name / "ground_truth.yaml"
+    if gt_path.exists():
+        try:
+            with open(gt_path) as f:
+                data = yaml.safe_load(f) or {}
+            for tc in data.get("test_cases", []):
+                for g in tc.get("expectations", {}).get("guidelines", []):
+                    g_norm = g.strip()
+                    if g_norm and g_norm not in seen:
+                        seen.add(g_norm)
+                        guidelines.append(g_norm)
+        except Exception:
+            pass
+
+    manifest_path = Path(".test/skills") / skill_name / "manifest.yaml"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest = yaml.safe_load(f) or {}
+            for g in manifest.get("scorers", {}).get("default_guidelines", []):
+                g_norm = g.strip()
+                if g_norm and g_norm not in seen:
+                    seen.add(g_norm)
+                    guidelines.append(g_norm)
+        except Exception:
+            pass
+
+    return guidelines
 
 
 def create_agent_evaluator(
@@ -593,21 +373,19 @@ def create_agent_evaluator(
     mlflow_experiment: str | None = None,
     tool_modules: list[str] | None = None,
 ) -> Callable:
-    """Factory for agent-based evaluator with focused judges.
+    """Factory for agent-based evaluator with semantic grading.
 
     Returns a GEPA-compatible callable: (candidate, example) -> (score, side_info)
 
     Args:
         skill_name: Name of the skill being evaluated.
-        judge_model: LLM model for judges (from ``--judge-model``).
+        judge_model: LLM model for semantic grading (from ``--judge-model``).
         agent_model: Model for Claude Code execution (from ``--agent-model``).
         tool_modules: MCP tool modules from manifest.yaml for criteria filtering.
     """
-    from .skillbench_evaluator import _collect_skill_guidelines
-
     skill_guidelines = _collect_skill_guidelines(skill_name)
     if skill_guidelines:
-        logger.info("Loaded %d domain guidelines for judges", len(skill_guidelines))
+        logger.info("Loaded %d domain guidelines for semantic grader", len(skill_guidelines))
 
     return AgentEvaluator(
         original_token_counts=original_token_counts,
@@ -676,17 +454,16 @@ def build_agent_eval_background(
     return (
         f"You are refining SKILL.md for '{skill_name}'.\n"
         "The skill is scored by a real Claude Code agent that executes tasks.\n"
-        "Three focused MLflow judges each ask ONE question (1 LLM call each):\n"
-        "  1. CORRECTNESS — Is the response factually and technically correct? (yes/no)\n"
-        "  2. COMPLETENESS — Does it fully address the question? (yes/no)\n"
-        "  3. GUIDELINE ADHERENCE — Does it follow Databricks conventions? (yes/no)\n\n"
-        "Judges load domain-specific eval criteria on-demand via skills= parameter.\n"
-        "Deterministic scorers check tool usage, assertions, and token efficiency.\n\n"
-        "Use Judge_correctness_with/without for accuracy feedback.\n"
-        "Use Judge_completeness_with/without for coverage feedback.\n"
-        "Use Judge_guideline_adherence for pattern compliance feedback.\n"
-        "Use Judge_effectiveness for per-dimension deltas.\n"
-        "Missing_Facts and Missing_Patterns show exact assertion pass/fail.\n\n"
+        "A semantic assertion grader checks per-assertion pass/fail with evidence:\n"
+        "  - Expected facts (substring + semantic matching)\n"
+        "  - Expected patterns (regex matching)\n"
+        "  - Guidelines and freeform assertions (semantic evaluation)\n\n"
+        "Per-assertion classification tells you exactly what to fix:\n"
+        "  NEEDS_SKILL — fails both with and without (skill must teach this)\n"
+        "  REGRESSION  — passes without skill, fails with (skill is hurting)\n"
+        "  POSITIVE    — fails without, passes with (skill is helping)\n\n"
+        "Deterministic trace scorers check tool usage and behavioral compliance.\n"
+        "Failed_Assertions lists exactly WHAT is missing with evidence.\n\n"
         "Focus on: guiding the agent to use the RIGHT tools with CORRECT arguments.\n"
         "Avoid: unnecessary tool calls, wrong tool selection, verbose instructions."
         f"{baseline_desc}"

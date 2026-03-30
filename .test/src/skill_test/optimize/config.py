@@ -137,19 +137,21 @@ _configure_litellm_retries()
 # the raw candidate tokens (includes background, ASI, framing).
 _REFLECTION_OVERHEAD_MULTIPLIER = 3
 
+# All evaluation uses real Claude Code agents (~3-5 min per evaluation).
+# Iterations are capped at 5 to keep optimization runs under 30 minutes.
 PRESETS: dict[str, GEPAConfig] = {
     "minimal": GEPAConfig(
-        engine=EngineConfig(max_metric_calls=8, parallel=True),
+        engine=EngineConfig(max_metric_calls=3, parallel=True),
         reflection=ReflectionConfig(reflection_lm=DEFAULT_REFLECTION_LM),
         refiner=RefinerConfig(max_refinements=1),
     ),
     "quick": GEPAConfig(
-        engine=EngineConfig(max_metric_calls=15, parallel=True),
+        engine=EngineConfig(max_metric_calls=5, parallel=True),
         reflection=ReflectionConfig(reflection_lm=DEFAULT_REFLECTION_LM),
         refiner=RefinerConfig(max_refinements=1),
     ),
     "standard": GEPAConfig(
-        engine=EngineConfig(max_metric_calls=50, parallel=True),
+        engine=EngineConfig(max_metric_calls=5, parallel=True),
         reflection=ReflectionConfig(
             reflection_lm=DEFAULT_REFLECTION_LM,
             reflection_minibatch_size=3,
@@ -157,7 +159,7 @@ PRESETS: dict[str, GEPAConfig] = {
         refiner=RefinerConfig(max_refinements=1),
     ),
     "thorough": GEPAConfig(
-        engine=EngineConfig(max_metric_calls=150, parallel=True),
+        engine=EngineConfig(max_metric_calls=5, parallel=True),
         reflection=ReflectionConfig(
             reflection_lm=DEFAULT_REFLECTION_LM,
             reflection_minibatch_size=3,
@@ -168,25 +170,23 @@ PRESETS: dict[str, GEPAConfig] = {
 
 # Base max_metric_calls per preset (used to scale by component count)
 PRESET_BASE_CALLS: dict[str, int] = {
-    "minimal": 8,
-    "quick": 15,
-    "standard": 50,
-    "thorough": 150,
+    "minimal": 3,
+    "quick": 5,
+    "standard": 5,
+    "thorough": 5,
 }
 
 # Per-preset caps: safety net so component scaling never exceeds a reasonable
 # ceiling.  Important for --tools-only mode which has many tool components.
 PRESET_MAX_CALLS: dict[str, int] = {
-    "minimal": 15,
-    "quick": 45,
-    "standard": 150,
-    "thorough": 300,
+    "minimal": 5,
+    "quick": 5,
+    "standard": 5,
+    "thorough": 5,
 }
 
-# Maximum total metric calls per pass to avoid runaway runtimes.
-# With many components, uncapped scaling (e.g., 50 * 17 = 850) can cause
-# multi-hour hangs with slower reflection models like Sonnet.
-MAX_METRIC_CALLS_PER_PASS = 300
+# Maximum total metric calls per pass to keep runs under 30 minutes.
+MAX_METRIC_CALLS_PER_PASS = 5
 
 # Models known to be fast enough for large multi-component optimization.
 # Other models get the metric-call cap applied.
