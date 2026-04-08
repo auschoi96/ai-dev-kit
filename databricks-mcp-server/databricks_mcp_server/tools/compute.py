@@ -58,6 +58,7 @@ def execute_code(
     destroy_context_on_completion: bool = False,
     workspace_path: str = None,
     run_name: str = None,
+    job_extra_params: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """Execute code on Databricks via serverless or cluster compute.
 
@@ -72,6 +73,8 @@ def execute_code(
     file_path: Run local file (.py/.scala/.sql/.r), auto-detects language.
     workspace_path: Save as notebook in workspace (omit for ephemeral).
     .ipynb: Pass raw JSON with serverless, auto-detected.
+    job_extra_params: Extra job params (serverless only). For dependencies:
+        {"environments": [{"environment_key": "env", "spec": {"client": "4", "dependencies": ["pandas", "sklearn"]}}]}
 
     Timeouts: serverless=1800s, cluster=120s, file=600s.
     Returns: {success, output, error, cluster_id, context_id} or {run_id, run_url}."""
@@ -137,6 +140,7 @@ def execute_code(
             run_name=run_name,
             cleanup=workspace_path is None,
             workspace_path=workspace_path,
+            job_extra_params=job_extra_params,
         )
         return result.to_dict()
 
