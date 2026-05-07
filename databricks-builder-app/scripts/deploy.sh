@@ -304,12 +304,22 @@ env:
     value: "databricks-meta-llama-3-3-70b-instruct"
   - name: DATABRICKS_MODEL_MINI
     value: "databricks-gemini-3-flash"
+  - name: ANTHROPIC_MODEL
+    value: "databricks-claude-opus-4-6"
+  - name: ANTHROPIC_MODEL_MINI
+    value: "databricks-claude-sonnet-4-6"
   - name: CLAUDE_CODE_STREAM_CLOSE_TIMEOUT
     value: "3600000"
+  - name: MLFLOW_CLAUDE_TRACING_ENABLED
+    value: "true"
   - name: MLFLOW_TRACKING_URI
     value: "databricks"
+  - name: MLFLOW_REGISTRY_URI
+    value: "databricks-uc"
   - name: MLFLOW_EXPERIMENT_NAME
-    value: "/Workspace/Shared/builder_app_ml_trace"
+    value: "/Shared/builder_app_ml_trace_uc"
+  - name: MLFLOW_TRACING_SQL_WAREHOUSE_ID
+    value: "4b9b953939869799"
   - name: AUTO_GRANT_PERMISSIONS_TO
     value: "account users"
 APPYAML
